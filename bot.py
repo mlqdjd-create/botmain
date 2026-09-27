@@ -1,15 +1,13 @@
 """
 بوت تيليجرام — Google Cloud → Cloud Run Service
-نظام طابور لمعالجة الروابط بالتتابع + لوحة أدمن
+نظام طابور لمعالجة الروابط بالتتابع
 """
 
 import asyncio
 import os
 import re
 import shutil
-import time
 import urllib.parse
-from datetime import datetime
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
@@ -17,23 +15,15 @@ from itertools import count
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import (
-    Message,
-    FSInputFile,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-)
+from aiogram.types import Message, FSInputFile
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from playwright.async_api import async_playwright
 
 # ============================================================
+# تشغيل محلي على جهاز المستخدم: يبقى التوكن داخل الملف كما طلبت.
 BOT_TOKEN = "8949437133:AAGLhrLaZ3oPNrsCgYgOlWUM8b3yqzQn0rc"
 TARGET_CHAT_ID = -2742181993
-ADMIN_ID = 6603530067
-
-GOOGLE_LAB_URL = "https://www.cloudskillsboost.google/focuses/20774?parent=catalog"
 
 USER_DATA_DIR = Path("data/chrome_profile")
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,11 +38,11 @@ CR_MAX = "8"
 
 XRAY_UUID = "D2CB8181-233C-4D18-9972-8A1B04DB0044"
 XRAY_SNI = "youtube.com"
+
+# ✅ المسار الجديد الذي سيُرسل في تكوين VLESS
 XRAY_PATH = "/Telegram_@oy_u4"
 
 url_sessions = {}
-user_registry: dict[int, dict] = {}
-stats = {"total_jobs": 0, "successful": 0, "failed": 0, "started_at": time.time()}
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -61,7 +51,6 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
 Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
 window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
 """
-
 
 # ============================================================
 def is_valid_google_sso_url(url: str) -> bool:
@@ -73,31 +62,48 @@ def is_valid_google_sso_url(url: str) -> bool:
 
 
 class GoogleNavigationError(RuntimeError):
-    pass
+    """فشل الوصول إلى Google بعد إعادة المحاولات ضمن الجلسة نفسها."""
 
 
 async def goto_google_with_retry(page, url: str, label: str, attempts: int = 3):
+    """يفتح صفحة Google دون اعتبار تأخر تحميل DOM فشلاً في التنقل.
+
+    Google SSO يمر بعدة تحويلات بين skills.google وaccounts.google، وقد يظل
+    DOM غير مكتمل مع أن التحويل وصل فعلاً. لذلك ننتظر بداية التحميل أولاً، ثم
+    نعيد المحاولة عند أخطاء الشبكة، بدلاً من إنهاء جلسة المستخدم فوراً.
+    """
     last_error = None
+
     for attempt in range(1, attempts + 1):
         try:
             await page.goto(url, wait_until="commit", timeout=75_000)
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=30_000)
             except Exception:
+                # بعض صفحات Google تتابع التحويل بعد commit؛ تتابع مرحلة الكشف
+                # لاحقاً بدلاً من فشل الجلسة بسبب انتظار DOM فقط.
                 pass
             print(f"[NAVIGATION] {label} نجح في المحاولة {attempt}")
             return
         except Exception as exc:
             last_error = exc
-            print(f"[NAVIGATION] {label} فشل {attempt}/{attempts}: {type(exc).__name__}")
+            print(
+                f"[NAVIGATION] {label} فشل في المحاولة {attempt}/{attempts}: "
+                f"{type(exc).__name__}: {exc}"
+            )
             if attempt == attempts:
                 break
+
+            # إلغاء أي تحويل عالق قبل إعادة فتح نفس الرابط.
             try:
                 await page.goto("about:blank", wait_until="commit", timeout=5_000)
             except Exception:
                 pass
             await asyncio.sleep(attempt * 3)
-    raise GoogleNavigationError(f"تعذر فتح {label}: {last_error}") from last_error
+
+    raise GoogleNavigationError(
+        f"تعذر فتح {label} بعد {attempts} محاولات: {last_error}"
+    ) from last_error
 
 
 def extract_project_id(url: str) -> str:
@@ -144,6 +150,7 @@ def extract_run_url(text: str) -> str:
 
 def build_vless(domain: str) -> str:
     domain = domain.replace("https://", "").replace("http://", "").rstrip("/")
+    # ✅ ترميز المسار ليصبح صالحاً داخل رابط VLESS
     encoded_path = urllib.parse.quote(XRAY_PATH, safe="")
     return (
         f"vless://{XRAY_UUID}@{domain}:443"
@@ -159,67 +166,45 @@ async def publish_result(final_url: str, vless: str):
     try:
         await bot.send_message(
             chat_id=TARGET_CHAT_ID,
-            text=f"🔗 <code>{final_url}</code>\n\n📋 <b>VLESS:</b>\n<code>{vless}</code>",
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        print(f"[PUBLISH-ERR] {e}")
-
-
-async def notify_admin(user_id, username, final_url, vless, job_id):
-    if not ADMIN_ID:
-        return
-    try:
-        await bot.send_message(
-            chat_id=ADMIN_ID,
             text=(
-                "🔔 <b>رابط جديد تم إنشاؤه</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <a href='tg://user?id={user_id}'>@{username}</a>\n"
-                f"🆔 <code>{user_id}</code>\n"
-                f"🔢 المهمة: <b>#{job_id}</b>\n"
-                f"🕐 {datetime.now().strftime('%H:%M:%S')}\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
                 f"🔗 <code>{final_url}</code>\n\n"
                 f"📋 <b>VLESS:</b>\n<code>{vless}</code>"
             ),
             disable_web_page_preview=True,
         )
     except Exception as e:
-        print(f"[ADMIN-NOTIFY-ERR] {e}")
+        print(f"[PUBLISH-ERR] {e}")
 
 
 async def take_screenshot_and_send(page, bot_instance, user_id, caption: str):
-    path = f"screen_{user_id}_{int(time.time())}.png"
+    path = f"screen_{user_id}.png"
     try:
-        await asyncio.wait_for(page.screenshot(path=path, full_page=False), timeout=15)
-        await bot_instance.send_photo(chat_id=user_id, photo=FSInputFile(path), caption=caption)
+        await asyncio.wait_for(
+            page.screenshot(path=path, full_page=False),
+            timeout=15
+        )
+        await bot_instance.send_photo(
+            chat_id=user_id,
+            photo=FSInputFile(path),
+            caption=caption
+        )
     except Exception as e:
         print(f"[SCREENSHOT-ERR] {e}")
     finally:
         if os.path.exists(path):
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+            os.remove(path)
 
 
 # ============================================================
-# انتظار رابط run.app (نفس المحرك — بدون تغيير)
+# انتظار رابط run.app — 5 محاولات تشمل Shadow DOM
 # ============================================================
-async def wait_for_run_url(page, timeout=240) -> str:
+async def wait_for_run_url(page, timeout=120) -> str:
     deadline = asyncio.get_event_loop().time() + timeout
-    attempt = 0
-    last_reload = asyncio.get_event_loop().time()
 
     while asyncio.get_event_loop().time() < deadline:
-        attempt += 1
-        try:
-            await asyncio.sleep(2)
-        except Exception:
-            pass
+        await asyncio.sleep(2)
 
-        # 1) locator مباشر
+        # محاولة 1: locator مباشر
         try:
             link_locator = page.locator('a[href*="run.app"]')
             count = await link_locator.count()
@@ -227,12 +212,11 @@ async def wait_for_run_url(page, timeout=240) -> str:
                 for i in range(count):
                     href = await link_locator.nth(i).get_attribute("href")
                     if href and "run.app" in href and "service-name" not in href.lower():
-                        print(f"[RUN-URL] ✅ locator → {href}")
                         return href
         except Exception:
             pass
 
-        # 2) من URL الصفحة
+        # محاولة 2: من URL الصفحة
         try:
             url_now = page.url
             if "run.app" in url_now:
@@ -241,12 +225,11 @@ async def wait_for_run_url(page, timeout=240) -> str:
                     url_now
                 )
                 if m and "service-name" not in m.group(1).lower():
-                    print(f"[RUN-URL] ✅ url → {m.group(1)}")
                     return m.group(1)
         except Exception:
             pass
 
-        # 3) Shadow DOM
+        # محاولة 3: JavaScript يخترق Shadow DOM
         try:
             result = await asyncio.wait_for(
                 page.evaluate("""() => {
@@ -270,12 +253,11 @@ async def wait_for_run_url(page, timeout=240) -> str:
                 timeout=10
             )
             if result and len(result) > 0:
-                print(f"[RUN-URL] ✅ shadow → {result[0]}")
                 return result[0]
         except Exception:
             pass
 
-        # 4) كل frame
+        # محاولة 4: كل frame
         try:
             for frame in page.frames:
                 try:
@@ -292,64 +274,26 @@ async def wait_for_run_url(page, timeout=240) -> str:
                         timeout=5
                     )
                     if links:
-                        print(f"[RUN-URL] ✅ frame → {links[0]}")
                         return links[0]
                 except Exception:
                     continue
         except Exception:
             pass
 
-        # 5) من النص
+        # محاولة 5: من نص الصفحة
         try:
             txt = await asyncio.wait_for(read_page_text(page), timeout=8)
             found = extract_run_url(txt)
             if found:
-                print(f"[RUN-URL] ✅ text → {found}")
                 return found
         except Exception:
             pass
 
-        # 6) من HTML الكامل
-        try:
-            html_url = await asyncio.wait_for(
-                page.evaluate("""() => {
-                    const html = document.documentElement.outerHTML;
-                    const m = html.match(/https:\\/\\/[\\w\\-]+\\.(?:[a-z]+-)?[a-z]+\\d?\\.run\\.app[\\w\\-\\/]*/g);
-                    if (m) {
-                        for (const u of m) {
-                            if (!u.includes('service-name')) return u;
-                        }
-                    }
-                    return '';
-                }"""),
-                timeout=10
-            )
-            if html_url:
-                print(f"[RUN-URL] ✅ html → {html_url}")
-                return html_url
-        except Exception:
-            pass
-
-        # كل 30 ثانية reload
-        now = asyncio.get_event_loop().time()
-        if now - last_reload > 30:
-            last_reload = now
-            try:
-                print(f"[RUN-URL] 🔄 reload (attempt {attempt})")
-                await page.reload(wait_until="domcontentloaded", timeout=30_000)
-                await asyncio.sleep(3)
-            except Exception as e:
-                print(f"[RUN-URL] reload fail: {e}")
-
-        if attempt % 15 == 0:
-            print(f"[RUN-URL] 🔍 attempt {attempt} — url={page.url[:80]}")
-
-    print(f"[RUN-URL] ❌ انتهى الوقت بعد {attempt} محاولة")
     return ""
 
 
 # ============================================================
-# أدوات النقر والتعبئة (نفس المحرك)
+# أدوات النقر والتعبئة
 # ============================================================
 async def find_next_button(page):
     texts = ["Next", "التالي", "Sign in", "Verify", "تحقق", "تسجيل الدخول"]
@@ -372,11 +316,16 @@ async def find_next_button(page):
 
 
 async def click_agree(page) -> bool:
-    texts = ["Agree and continue", "Agree", "I understand", "Accept", "Continue",
-             "موافق ومتابعة", "أوافق", "متابعة", "Close"]
+    texts = [
+        "Agree and continue", "Agree", "I understand", "Accept",
+        "Continue", "موافق ومتابعة", "أوافق", "متابعة", "Close",
+    ]
     for frame in page.frames:
         for t in texts:
-            for sel in [f'button:has-text("{t}")', f'[role="button"]:has-text("{t}")']:
+            for sel in [
+                f'button:has-text("{t}")',
+                f'[role="button"]:has-text("{t}")',
+            ]:
                 try:
                     btn = await frame.query_selector(sel)
                     if btn and await btn.is_visible():
@@ -398,7 +347,9 @@ async def click_agree(page) -> bool:
 async def click_checkbox(page) -> bool:
     for frame in page.frames:
         try:
-            cbs = await frame.query_selector_all('input[type="checkbox"], [role="checkbox"]')
+            cbs = await frame.query_selector_all(
+                'input[type="checkbox"], [role="checkbox"]'
+            )
             for cb in cbs:
                 try:
                     if await cb.is_visible():
@@ -457,6 +408,7 @@ async def click_create_service_safe(page) -> bool:
             return True
     except Exception:
         pass
+
     try:
         btn = page.get_by_role("button", name="Create")
         if await btn.is_visible(timeout=2000):
@@ -659,6 +611,9 @@ async def find_input(page, selectors):
     return None, None
 
 
+# ============================================================
+# نافذة الشروط
+# ============================================================
 async def has_cloud_consent(page) -> bool:
     try:
         for frame in page.frames:
@@ -701,6 +656,9 @@ async def handle_cloud_consent(page) -> bool:
     return False
 
 
+# ============================================================
+# تفعيل Cloud Run API
+# ============================================================
 async def enable_cloud_run_api(page, project_id: str, authuser: str) -> bool:
     api_url = (
         f"https://console.cloud.google.com/apis/library/run.googleapis.com"
@@ -711,8 +669,10 @@ async def enable_cloud_run_api(page, project_id: str, authuser: str) -> bool:
     except GoogleNavigationError as exc:
         print(f"[NAVIGATION] تعذر فتح صفحة API: {exc}")
         return False
+
     await asyncio.sleep(5)
     await handle_cloud_consent(page)
+
     for attempt in range(3):
         for frame in page.frames:
             try:
@@ -733,6 +693,9 @@ async def enable_cloud_run_api(page, project_id: str, authuser: str) -> bool:
     return False
 
 
+# ============================================================
+# كشف المرحلة
+# ============================================================
 async def detect_stage(page) -> str:
     try:
         for frame in page.frames:
@@ -744,18 +707,22 @@ async def detect_stage(page) -> str:
                 continue
     except Exception:
         pass
+
     try:
         if await asyncio.wait_for(has_cloud_consent(page), timeout=5):
             return "cr_consent"
     except Exception:
         pass
+
     txt = await read_page_text(page)
     low = txt.lower()
+
     if any(k in low for k in [
         "i agree to the google cloud platform terms of service",
         "agree and continue",
     ]):
         return "consent"
+
     try:
         url = page.url
         if ("console.cloud.google.com" in url and
@@ -767,16 +734,20 @@ async def detect_stage(page) -> str:
             return "dashboard"
     except Exception:
         pass
+
     if any(k in low for k in ["type the text you hear", "enter the characters you see"]):
         return "captcha"
     if any(k in low for k in ["2-step verification", "verification code"]):
         return "2fa"
     if "welcome to your new account" in low:
         return "welcome"
+
     try:
         for frame in page.frames:
             try:
-                email = await frame.query_selector('input[type="email"], input[name="identifier"]')
+                email = await frame.query_selector(
+                    'input[type="email"], input[name="identifier"]'
+                )
                 if email and await email.is_visible():
                     try:
                         val = await email.input_value()
@@ -789,9 +760,13 @@ async def detect_stage(page) -> str:
                 continue
     except Exception:
         pass
+
     return "unknown"
 
 
+# ============================================================
+# اختيار المشروع
+# ============================================================
 async def is_project_selected(page) -> bool:
     try:
         for frame in page.frames:
@@ -820,11 +795,14 @@ async def pick_project(page) -> str:
                 break
         except Exception:
             continue
+
     if not clicked:
         return ""
+
     await asyncio.sleep(4)
     picked = False
     project_id = ""
+
     for frame in page.frames:
         try:
             links = await frame.query_selector_all('a')
@@ -844,6 +822,7 @@ async def pick_project(page) -> str:
                 break
         except Exception:
             continue
+
     if not picked:
         try:
             result = await page.evaluate("""() => {
@@ -863,12 +842,14 @@ async def pick_project(page) -> str:
                 picked = True
         except Exception:
             pass
+
     if not picked:
         try:
             await page.keyboard.press("Escape")
         except Exception:
             pass
         return ""
+
     await asyncio.sleep(6)
     txt = await read_page_text(page)
     m = re.search(r'qwiklabs-gcp-[\w\-]+', txt)
@@ -878,22 +859,12 @@ async def pick_project(page) -> str:
 
 
 # ============================================================
-# Workflow الرئيسي (نفس المحرك — الرسائل جديدة فقط)
+# Workflow الرئيسي
 # ============================================================
-async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", job_id: int = 0):
+async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
     tag = f"@{username}"
     stage_stuck_since = {}
     STUCK_LIMIT = 180
-
-    def box(title: str, body: str = "") -> str:
-        s = [
-            "╭━━━━━━━━━━━━━━━━━━━━╮",
-            f"┃  {title}",
-            "╰━━━━━━━━━━━━━━━━━━━━╯",
-        ]
-        if body:
-            s.append(body)
-        return "\n".join(s)
 
     async def log(msg):
         try:
@@ -908,25 +879,37 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
             return False
         elapsed = now - stage_stuck_since[stage]
         if elapsed >= STUCK_LIMIT:
-            await log(box("⚠️ تجمد مؤقت", f"المرحلة: <code>{stage}</code>\nسيتم تخطي الدور."))
-            await take_screenshot_and_send(page, bot, user_id, f"📸 تجمد: {stage}")
+            await log(
+                f"[{tag}] ⚠️ <b>تجمد في مرحلة <code>{stage}</code> "
+                f"لأكثر من 3 دقائق</b>\nسيتم تخطي دورك."
+            )
+            await take_screenshot_and_send(
+                page, bot, user_id,
+                f"[{tag}] 📸 تجمد في: {stage}"
+            )
             return True
         return False
 
     state = {
         "password": False, "captcha": False, "2fa": False,
         "consent": False, "welcome": False, "dashboard": False,
-        "email_next_clicked": False, "cr_consent": False, "api_enabled": False,
+        "email_next_clicked": False, "cr_consent": False,
+        "api_enabled": False,
     }
     authuser = "0"
     project_id_from_url = extract_project_id(sso_url)
 
     try:
-        await log(box("⚙️ جاري التهيئة", f"👤 {tag}\n🔢 المهمة: <b>#{job_id}</b>\n\nيتم الاتصال بـ Google…"))
+        await log(
+            f"☁️ <b>𝙂𝘾.𝙍𝙪𝙣</b>\n"
+            f"✅ تم استلام الرابط. جاري التنفيذ الآن…\n\n"
+            f"[{tag}] • 1) فتح رابط الطالب…"
+        )
 
         start = asyncio.get_event_loop().time()
         max_wait = 60 * 35
         last_stage = ""
+        step = 1
 
         while asyncio.get_event_loop().time() - start < max_wait:
             await asyncio.sleep(3)
@@ -961,24 +944,34 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                     try:
                         await btn.click(timeout=3000)
                         state["email_next_clicked"] = True
+                        step += 1
+                        await log(f"[{tag}] • • {step} ✅")
                         await asyncio.sleep(5)
                     except Exception:
                         pass
 
-            if stage == "password" and not state["password"]:
-                state["password"] = True
-                await log(box("🔐 مطلوب كلمة المرور", f"👤 {tag}\n\nأرسل كلمة السر هنا."))
+            if stage == "password":
+                if not state["password"]:
+                    state["password"] = True
+                    await log(
+                        f"[{tag}] • • 🔐 مطلوب كلمة السر\n\nأرسل كلمة السر هنا."
+                    )
                 continue
 
-            if stage == "captcha" and not state["captcha"]:
-                state["captcha"] = True
-                await log(box("🤖 مطلوب CAPTCHA", f"👤 {tag}\n\nاقرأ الصورة وأرسل الكود."))
-                await take_screenshot_and_send(page, bot, user_id, "🔍 صورة CAPTCHA")
+            if stage == "captcha":
+                if not state["captcha"]:
+                    state["captcha"] = True
+                    await log(
+                        f"[{tag}] • • 🤖 مطلوب CAPTCHA\n\nاقرأ الصورة وأرسل الكود."
+                    )
                 continue
 
-            if stage == "2fa" and not state["2fa"]:
-                state["2fa"] = True
-                await log(box("📱 مطلوب كود 2FA", f"👤 {tag}\n\nأرسل الكود."))
+            if stage == "2fa":
+                if not state["2fa"]:
+                    state["2fa"] = True
+                    await log(
+                        f"[{tag}] • • 📱 مطلوب كود 2FA\n\nأرسل الكود هنا."
+                    )
                 continue
 
             if stage == "consent" and not state["consent"]:
@@ -1009,6 +1002,8 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
 
             if stage == "dashboard" and not state["dashboard"]:
                 state["dashboard"] = True
+                step += 1
+                await log(f"[{tag}] • • {step} ✅")
 
                 try:
                     parsed = urllib.parse.urlparse(page.url)
@@ -1022,32 +1017,53 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                 if not project_id:
                     project_picked = await is_project_selected(page)
                     if not project_picked:
-                        await log(box("📦 اختيار المشروع", f"👤 {tag}\nجاري تحديد مشروع Qwiklabs…"))
+                        step += 1
+                        await log(f"[{tag}] • {step}) اختيار المشروع…")
                         try:
-                            project_id = await asyncio.wait_for(pick_project(page), timeout=60)
+                            project_id = await asyncio.wait_for(
+                                pick_project(page), timeout=60
+                            )
                         except Exception:
                             project_id = ""
                         if not project_id:
-                            await log(box("❌ فشل اختيار المشروع", f"👤 {tag}"))
-                            await take_screenshot_and_send(page, bot, user_id, "❌ فشل المشروع")
+                            await log(f"[{tag}] ❌ فشل اختيار المشروع")
+                            await take_screenshot_and_send(
+                                page, bot, user_id,
+                                f"[{tag}] ❌ فشل اختيار المشروع"
+                            )
                             return ""
+                        step += 1
+                        await log(f"[{tag}] • • {step} ✅")
                     else:
                         txt = await read_page_text(page)
                         m = re.search(r'qwiklabs-gcp-[\w\-]+', txt)
                         if m:
                             project_id = m.group(0)
+                else:
+                    step += 1
+                    await log(f"[{tag}] • • {step} ✅ (Project: {project_id})")
 
                 await asyncio.sleep(3)
 
                 if project_id and not state["api_enabled"]:
-                    await log(box("🔌 تفعيل Cloud Run API", f"👤 {tag}\n📦 <code>{project_id}</code>"))
+                    step += 1
+                    await log(f"[{tag}] • {step}) تفعيل Cloud Run API…")
                     try:
-                        await asyncio.wait_for(enable_cloud_run_api(page, project_id, authuser), timeout=90)
+                        api_ok = await asyncio.wait_for(
+                            enable_cloud_run_api(page, project_id, authuser),
+                            timeout=90
+                        )
                     except Exception:
-                        pass
+                        api_ok = False
                     state["api_enabled"] = True
+                    step += 1
+                    await log(
+                        f"[{tag}] • • {step} "
+                        f"{'✅ API مفعّل' if api_ok else '⚠️ API غير مؤكد، متابعة…'}"
+                    )
 
-                await log(box("🚀 فتح Cloud Run", f"👤 {tag}\n📦 <code>{project_id or 'auto'}</code>\n\nجاري تجهيز الصفحة…"))
+                step += 1
+                await log(f"[{tag}] • {step}) فتح Cloud Run…")
 
                 target_url = (
                     f"https://console.cloud.google.com/run/create"
@@ -1056,16 +1072,25 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                 ) if project_id else "https://console.cloud.google.com/run/create"
 
                 try:
-                    await goto_google_with_retry(page, target_url, "صفحة إنشاء Cloud Run", attempts=2)
+                    await goto_google_with_retry(
+                        page, target_url, "صفحة إنشاء Cloud Run", attempts=2
+                    )
                 except GoogleNavigationError:
-                    await log(box("⚠️ تعذر فتح Cloud Run", f"👤 {tag}"))
+                    await log(
+                        f"[{tag}] ⚠️ تعذر فتح Cloud Run بعد إعادة المحاولة. "
+                        "سيتم تخطي الرابط للحفاظ على الطابور."
+                    )
                     return "SKIP"
 
                 await asyncio.sleep(8)
+
                 try:
                     await asyncio.wait_for(handle_cloud_consent(page), timeout=20)
                 except Exception:
                     pass
+
+                step += 1
+                await log(f"[{tag}] • • {step} ✅")
 
                 await wait_for_input(
                     page,
@@ -1074,7 +1099,8 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                 )
                 await asyncio.sleep(2)
 
-                await log(box("🏗️ جاري البناء", f"👤 {tag}\n\n📝 تعبئة الحقول…"))
+                step += 1
+                await log(f"[{tag}] • {step}) تعبئة الحقول…")
 
                 img_ok = await fill_by_shadow_dom(page, "Container image URL", CR_IMAGE)
                 if not img_ok:
@@ -1084,6 +1110,7 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                         'input[aria-label*="Container image"]',
                         'input[formcontrolname="imageUrl"]',
                     ], CR_IMAGE)
+
                 await asyncio.sleep(2)
 
                 srv_ok = await fill_by_shadow_dom(page, "Service name", CR_SERVICE_NAME)
@@ -1094,7 +1121,11 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                         'input[aria-label*="Service name"]',
                         'input[formcontrolname="serviceName"]',
                     ], CR_SERVICE_NAME)
+
                 await asyncio.sleep(2)
+
+                step += 1
+                await log(f"[{tag}] • • {step} ✅")
 
                 await select_radio(page, "Allow public access")
                 await asyncio.sleep(1)
@@ -1117,7 +1148,10 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                     except Exception:
                         pass
 
-                await click_text(page, ["Containers, Networking, Security", "Containers, Networking"])
+                await click_text(page, [
+                    "Containers, Networking, Security",
+                    "Containers, Networking",
+                ])
                 await asyncio.sleep(2)
 
                 try:
@@ -1140,7 +1174,8 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                 await select_checkbox_label(page, "Startup CPU boost")
                 await asyncio.sleep(1)
 
-                await log(box("🛠️ إنشاء الخدمة", f"👤 {tag}\n\nجاري الضغط على Create…"))
+                step += 1
+                await log(f"[{tag}] • {step}) Create الخدمة…")
 
                 created = False
                 for attempt in range(3):
@@ -1150,41 +1185,55 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                     await asyncio.sleep(2)
 
                 if not created:
-                    await take_screenshot_and_send(page, bot, user_id, "⚠️ فشل Create")
+                    await take_screenshot_and_send(
+                        page, bot, user_id,
+                        f"[{tag}] ⚠️ فشل الضغط على Create"
+                    )
 
-                await log(box("⏳ انتظار النشر", f"👤 {tag}\n\nجاري انتظار رابط run.app…\n<i>قد يستغرق حتى دقيقتين.</i>"))
+                step += 1
+                await log(f"[{tag}] • • {step} ✅ Create")
+
+                step += 1
+                await log(f"[{tag}] • {step}) انتظار رابط النشر…")
 
                 try:
-                    await asyncio.wait_for(page.wait_for_load_state("networkidle"), timeout=30)
+                    await asyncio.wait_for(
+                        page.wait_for_load_state("networkidle"),
+                        timeout=30
+                    )
                 except Exception:
                     pass
 
                 final_url = ""
                 try:
-                    final_url = await wait_for_run_url(page, timeout=240)
-                except Exception as e:
-                    print(f"[RUN-URL-EXC] {type(e).__name__}: {e}")
+                    final_url = await asyncio.wait_for(
+                        wait_for_run_url(page, timeout=120),
+                        timeout=130
+                    )
+                except Exception:
                     final_url = ""
 
                 if final_url:
-                    domain = final_url.replace("https://", "").replace("http://", "").rstrip("/")
+                    domain = (
+                        final_url
+                        .replace("https://", "")
+                        .replace("http://", "")
+                        .rstrip("/")
+                    )
                     vless = build_vless(domain)
-
-                    await log(box(
-                        "🎉 تم النشر بنجاح",
-                        (
-                            f"👤 {tag}\n"
-                            f"🔢 المهمة: <b>#{job_id}</b>\n\n"
-                            f"🔗 <b>الرابط:</b>\n<code>{final_url}</code>\n\n"
-                            f"📋 <b>VLESS:</b>\n<code>{vless}</code>"
-                        )
-                    ))
+                    await log(
+                        f"[{tag}] • 🎉 <b>تم النشر!</b>\n\n"
+                        f"🔗 <b>الرابط:</b>\n<code>{final_url}</code>\n\n"
+                        f"📋 <b>VLESS:</b>\n<code>{vless}</code>"
+                    )
                     await publish_result(final_url, vless)
-                    await notify_admin(user_id, username, final_url, vless, job_id)
                     return final_url
                 else:
-                    await log(box("⏰ انتهى الوقت", f"👤 {tag}\nلم يتم استخراج الرابط."))
-                    await take_screenshot_and_send(page, bot, user_id, "⏰ Timeout")
+                    await log(f"[{tag}] ⏰ انتهى الوقت بدون رابط")
+                    await take_screenshot_and_send(
+                        page, bot, user_id,
+                        f"[{tag}] ⏰ آخر حالة للصفحة"
+                    )
                     return ""
 
         return ""
@@ -1192,24 +1241,36 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
     except Exception as e:
         print(f"[WORKFLOW-ERR] {e}")
         try:
-            await take_screenshot_and_send(page, bot, user_id, f"⚠️ خطأ: {str(e)[:150]}")
+            await take_screenshot_and_send(
+                page, bot, user_id,
+                f"[{tag}] ⚠️ خطأ عام: {str(e)[:200]}"
+            )
         except Exception:
             pass
         return ""
 
 
-async def full_workflow_safe(page, user_id, send_msg, username, sso_url: str = "", job_id: int = 0):
+# ============================================================
+# غلاف Timeout صارم 35 دقيقة
+# ============================================================
+async def full_workflow_safe(page, user_id, send_msg, username, sso_url: str = ""):
     tag = f"@{username}"
     try:
         result = await asyncio.wait_for(
-            full_workflow(page, user_id, send_msg, username, sso_url, job_id),
+            full_workflow(page, user_id, send_msg, username, sso_url),
             timeout=60 * 35
         )
         return result
     except asyncio.TimeoutError:
         try:
-            await send_msg(f"[{tag}] ⏰ <b>انتهى الحد الأقصى (35 دق)</b>")
-            await take_screenshot_and_send(page, bot, user_id, f"[{tag}] ⏰ Timeout")
+            await send_msg(
+                f"[{tag}] ⏰ <b>انتهى الحد الأقصى (35 دق)</b>\n"
+                f"تم إنهاء الجلسة تلقائياً."
+            )
+            await take_screenshot_and_send(
+                page, bot, user_id,
+                f"[{tag}] ⏰ Timeout 35 دقيقة"
+            )
         except Exception:
             pass
         return "SKIP"
@@ -1222,7 +1283,7 @@ async def full_workflow_safe(page, user_id, send_msg, username, sso_url: str = "
 
 
 # ============================================================
-# جلسة متصفح (نفس المحرك)
+# ✅ جلسة متصفح محلية بدون بروكسي
 # ============================================================
 async def start_url_session(user_id, url):
     user_specific_dir = USER_DATA_DIR / f"user_{user_id}"
@@ -1232,35 +1293,35 @@ async def start_url_session(user_id, url):
         user_specific_dir.mkdir(parents=True, exist_ok=True)
         p = await async_playwright().start()
         launch_args = dict(
-            user_data_dir=str(user_specific_dir),
-            headless=True,
-            viewport=VIEWPORT,
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            timezone_id="America/New_York",
-            args=[
-                "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                "--disable-background-networking",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-tools", "--disable-extensions", "--disable-plugins",
-                "--disable-sync", "--no-first-run", "--no-default-browser-check",
-                "--disable-default-apps", "--disable-component-update",
-                "--disable-domain-reliability",
-                "--disable-features=Translate,BackForwardCache,"
-                "AcceptCHFrame,MediaRouter,OptimizationHints",
-                "--disable-ipc-flooding-protection", "--disable-hang-monitor",
-                "--disable-prompt-on-repost",
-                "--disable-client-side-phishing-detection",
-                "--disable-popup-blocking", "--metrics-recording-only",
-                "--mute-audio", "--no-zygote",
-                "--js-flags=--max-old-space-size=256", "--single-process",
-            ],
-            ignore_default_args=["--enable-automation"],
-        )
+                user_data_dir=str(user_specific_dir),
+                headless=True,
+                viewport=VIEWPORT,
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                locale="en-US",
+                timezone_id="America/New_York",
+                args=[
+                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                    "--disable-background-networking",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-tools", "--disable-extensions", "--disable-plugins",
+                    "--disable-sync", "--no-first-run", "--no-default-browser-check",
+                    "--disable-default-apps", "--disable-component-update",
+                    "--disable-domain-reliability",
+                    "--disable-features=Translate,BackForwardCache,"
+                    "AcceptCHFrame,MediaRouter,OptimizationHints",
+                    "--disable-ipc-flooding-protection", "--disable-hang-monitor",
+                    "--disable-prompt-on-repost",
+                    "--disable-client-side-phishing-detection",
+                    "--disable-popup-blocking", "--metrics-recording-only",
+                    "--mute-audio", "--no-zygote",
+                    "--js-flags=--max-old-space-size=256", "--single-process",
+                ],
+                ignore_default_args=["--enable-automation"],
+            )
         browser = await p.chromium.launch_persistent_context(**launch_args)
         await browser.add_init_script(STEALTH_JS)
         page = browser.pages[0] if browser.pages else await browser.new_page()
@@ -1283,7 +1344,11 @@ async def start_url_session(user_id, url):
             pass
 
         await asyncio.sleep(2)
-        url_sessions[user_id] = {"playwright": p, "browser": browser, "page": page}
+        url_sessions[user_id] = {
+            "playwright": p,
+            "browser": browser,
+            "page": page,
+        }
         return True
     except Exception as exc:
         print(f"[SESSION] فشل بدء جلسة {user_id}: {type(exc).__name__}: {exc}")
@@ -1302,6 +1367,7 @@ async def close_url_session(user_id):
 
 
 async def safe_close_context(browser, playwright_instance, user_id):
+    """إغلاق idempotent لا يرمي خطأ إذا أُغلقت الصفحة/السياق مسبقاً."""
     if browser:
         try:
             await browser.close(reason=f"finish user session {user_id}")
@@ -1359,18 +1425,8 @@ queued_job_ids: deque[int] = deque()
 active_job_id: int | None = None
 
 
-def register_user(user_id: int, username: str):
-    if user_id not in user_registry:
-        user_registry[user_id] = {
-            "username": username,
-            "first_seen": time.time(),
-            "total_jobs": 0,
-        }
-    user_registry[user_id]["username"] = username
-    user_registry[user_id]["total_jobs"] += 1
-
-
 def pending_jobs_for_user(user_id: int) -> list[QueueItem]:
+    """يعيد كل روابط المستخدم المنتظرة بالترتيب الذي ستعمل به."""
     return [
         jobs_by_id[job_id]
         for job_id in queued_job_ids
@@ -1379,6 +1435,7 @@ def pending_jobs_for_user(user_id: int) -> list[QueueItem]:
 
 
 def queue_position(job_id: int) -> int | None:
+    """موضع المهمة بين الجلسة الجارية والمهام المنتظرة، إن كانت لم تبدأ."""
     try:
         waiting_index = list(queued_job_ids).index(job_id)
     except ValueError:
@@ -1387,6 +1444,7 @@ def queue_position(job_id: int) -> int | None:
 
 
 def cancel_queued_jobs_for_user(user_id: int) -> int:
+    """يلغي كل الروابط التي لم تبدأ بعد، من دون العبث بطابور asyncio الداخلي."""
     cancelled_count = 0
     for job_id in list(queued_job_ids):
         item = jobs_by_id.get(job_id)
@@ -1413,12 +1471,12 @@ async def queue_worker():
         try:
             queued_job_ids.remove(item.job_id)
         except ValueError:
+            # يمكن أن يحدث فقط إذا أُلغي الرابط قبل أن يصله العامل.
             task_queue.task_done()
             continue
 
         active_job_id = item.job_id
         active_users.add(user_id)
-        stats["total_jobs"] += 1
         print(f"[WORKER] ▶ بدأ جلسة {user_id} (job={item.job_id})")
         try:
             success = await start_url_session(user_id, url)
@@ -1426,28 +1484,26 @@ async def queue_worker():
                 s = url_sessions.get(user_id)
                 if s:
                     result = await full_workflow_safe(
-                        s["page"], user_id, send_msg, username,
-                        sso_url=url, job_id=item.job_id
+                        s["page"], user_id, send_msg, username, sso_url=url
                     )
                     if result == "SKIP":
-                        stats["failed"] += 1
                         try:
-                            await send_msg(f"[@{username}] ⏭ <b>تم تخطي دورك</b>")
+                            await send_msg(
+                                f"[@{username}] ⏭ <b>تم تخطي دورك</b> بسبب التجمد.\n"
+                                f"يمكنك إرسال الرابط مجدداً."
+                            )
                         except Exception:
                             pass
-                    elif result:
-                        stats["successful"] += 1
-                    else:
-                        stats["failed"] += 1
         except GoogleNavigationError as e:
-            stats["failed"] += 1
             print(f"[WORKER-NAVIGATION-ERR] {e}")
             try:
-                await send_msg("⚠️ تعذر الوصول إلى Google بعد إعادة المحاولة.")
+                await send_msg(
+                    "⚠️ تعذر الوصول إلى Google بعد إعادة المحاولة. "
+                    "تم تخطي هذا الرابط حتى لا يتوقف الطابور؛ أرسله لاحقاً."
+                )
             except Exception:
                 pass
         except Exception as e:
-            stats["failed"] += 1
             print(f"[WORKER-ERR] {e}")
             try:
                 await send_msg(f"⚠️ خطأ: {str(e)[:150]}")
@@ -1466,7 +1522,10 @@ async def queue_worker():
 # البوت
 # ============================================================
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN غير مضبوط.")
+    raise RuntimeError(
+        "BOT_TOKEN غير مضبوط. أضفه كمتغير بيئة في إعدادات Cloud Run."
+    )
+
 
 bot = Bot(
     token=BOT_TOKEN,
@@ -1477,44 +1536,13 @@ dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    uid = message.from_user.id
-    uname = message.from_user.username or "user"
-    register_user(uid, uname)
-
     await message.answer(
-        "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        "┃  ☁️ <b>Cloud Run Auto Deploy</b>\n"
-        "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        "🎯 <b>ما يفعله البوت:</b>\n"
-        "• ينشئ خدمة Cloud Run تلقائياً\n"
-        "• يولّد رابط VLESS محدّث\n"
-        "• يرسل الرابط للمستخدم والأدمن\n\n"
-        "📎 <b>الخطوات:</b>\n"
-        f"<a href='{GOOGLE_LAB_URL}'>1) افتح المختبر من هنا</a>\n"
-        "2) انسخ رابط Google SSO\n"
-        "3) أرسله هنا مباشرة\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚡ <b>الأوامر:</b>\n"
-        "/status — حالة الطابور\n"
-        "/cancel — إلغاء المهام\n"
-        "/help — المساعدة",
-        disable_web_page_preview=True,
-    )
-
-
-@dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(
-        "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        "┃  📖 <b>المساعدة</b>\n"
-        "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        "🔹 أرسل رابط Google SSO من المختبر مباشرة\n"
-        "🔹 انتظر — البوت سيتولى كل شيء\n"
-        "🔹 ستصلك رسالة النجاح + الرابط + VLESS\n\n"
-        "📌 <b>ملاحظات:</b>\n"
-        "• يمكنك إرسال أي عدد من الروابط\n"
-        "• إذا طُلب منك كلمة السر — أرسلها هنا\n"
-        "• /cancel لإلغاء كل مهامك"
+        "👋 <b>Google Cloud → Cloud Run</b>\n\n"
+        "📎 أرسل رابط <b>Google SSO</b> من:\n"
+        "https://www.skills.google/focuses/33353?parent=catalog\n\n"
+        "🔐 كلمة السر → يخبرك البوت\n"
+        "🎯 كل شيء تلقائي\n\n"
+        "/cancel — إلغاء\n/status — حالة"
     )
 
 
@@ -1522,146 +1550,60 @@ async def cmd_help(message: Message):
 async def cmd_status(message: Message):
     uid = message.from_user.id
     pending = pending_jobs_for_user(uid)
-    lines = ["╭━━━━━━━━━━━━━━━━━━━━╮", "┃  📊 <b>حالة الطابور</b>", "╰━━━━━━━━━━━━━━━━━━━━╯", ""]
+    lines = []
 
     if uid in active_users:
-        lines.append("🟢 <b>لديك مهمة قيد التشغيل الآن.</b>")
+        lines.append("🟢 لديك مشروع قيد التشغيل حالياً.")
+
     if pending:
-        positions = [str(queue_position(i.job_id)) for i in pending if queue_position(i.job_id)]
-        lines.append(f"⏳ <b>{len(pending)}</b> مهمة في الانتظار")
-        lines.append(f"📍 المواضع: <b>{'، '.join(positions)}</b>")
-    if not (uid in active_users or pending):
-        lines.append("💤 لا توجد لديك أي مهام حالياً.")
-    lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📋 إجمالي المنتظرين: <b>{len(queued_job_ids)}</b>")
+        positions = [queue_position(item.job_id) for item in pending]
+        positions = [str(pos) for pos in positions if pos is not None]
+        lines.append(
+            f"⏳ لديك <b>{len(pending)}</b> رابط/روابط في الطابور "
+            f"(المواضع: <b>{'، '.join(positions)}</b>)."
+        )
+
+    if not lines:
+        lines.append("❌ لا توجد لديك أي مشاريع تعمل حالياً أو في الطابور.")
+
+    lines.extend([
+        f"📋 إجمالي الروابط المنتظرة: <b>{len(queued_job_ids)}</b>",
+    ])
     await message.answer("\n".join(lines))
 
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message):
     uid = message.from_user.id
-    cancelled = cancel_queued_jobs_for_user(uid)
+    cancelled_waiting = cancel_queued_jobs_for_user(uid)
     if uid in active_users:
         await close_url_session(uid)
         active_users.discard(uid)
-        suffix = f"\n🗑️ حُذف <b>{cancelled}</b> من الطابور." if cancelled else ""
-        await message.answer(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "┃  ✅ <b>تم الإلغاء</b>\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n"
-            f"تم إيقاف المهمة الجارية.{suffix}"
+        suffix = (
+            f" وتم حذف <b>{cancelled_waiting}</b> رابط/روابط من الطابور."
+            if cancelled_waiting else ""
         )
-    elif cancelled:
-        await message.answer(f"✅ حُذف <b>{cancelled}</b> من الطابور.")
+        await message.answer(f"✅ تم إلغاء الجلسة الحالية.{suffix}")
+    elif cancelled_waiting:
+        await message.answer(
+            f"✅ تم حذف <b>{cancelled_waiting}</b> رابط/روابط من الطابور."
+        )
     else:
-        await message.answer("💤 لا يوجد ما يمكن إلغاؤه.")
+        await message.answer("ليس لديك مشروع يعمل حالياً أو روابط في الطابور.")
 
 
-# ============================================================
-# لوحة الأدمن
-# ============================================================
-@dp.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    uptime = int(time.time() - stats["started_at"])
-    hours = uptime // 3600
-    minutes = (uptime % 3600) // 60
-
-    text = (
-        "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        "┃  👑 <b>لوحة الأدمن</b>\n"
-        "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        "📊 <b>الإحصائيات:</b>\n"
-        f"├ 👥 المستخدمون: <b>{len(user_registry)}</b>\n"
-        f"├ 📦 المهام الكلية: <b>{stats['total_jobs']}</b>\n"
-        f"├ ✅ نجحت: <b>{stats['successful']}</b>\n"
-        f"├ ❌ فشلت: <b>{stats['failed']}</b>\n"
-        f"├ ⏳ في الطابور: <b>{len(queued_job_ids)}</b>\n"
-        f"├ 🔥 نشط الآن: <b>{len(active_users)}</b>\n"
-        f"└ ⏱️ مدة التشغيل: <b>{hours}h {minutes}m</b>\n"
-    )
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 قائمة المستخدمين", callback_data="admin:users")],
-        [InlineKeyboardButton(text="📊 تحديث", callback_data="admin:refresh")],
-    ])
-    await message.answer(text, reply_markup=keyboard)
-
-
-@dp.callback_query(F.data == "admin:users")
-async def admin_users(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔", show_alert=True)
-        return
-    if not user_registry:
-        await callback.answer("لا يوجد مستخدمون بعد", show_alert=True)
-        return
-
-    lines = ["╭━━━━━━━━━━━━━━━━━━━━╮", "┃  👥 <b>المستخدمون</b>", "╰━━━━━━━━━━━━━━━━━━━━╯", ""]
-    users_sorted = sorted(user_registry.items(), key=lambda x: x[1]["total_jobs"], reverse=True)[:50]
-    for uid, info in users_sorted:
-        uname = info["username"]
-        jobs = info["total_jobs"]
-        marker = " 🟢" if uid in active_users else ""
-        lines.append(f"• <a href='tg://user?id={uid}'>@{uname}</a>{marker}\n  <code>{uid}</code> — <b>{jobs}</b> مهمة")
-    if len(user_registry) > 50:
-        lines.append(f"\n<i>... و {len(user_registry) - 50} آخرون</i>")
-
-    try:
-        await callback.message.edit_text("\n".join(lines), disable_web_page_preview=True)
-    except Exception:
-        await callback.message.answer("\n".join(lines), disable_web_page_preview=True)
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "admin:refresh")
-async def admin_refresh(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔", show_alert=True)
-        return
-    uptime = int(time.time() - stats["started_at"])
-    hours = uptime // 3600
-    minutes = (uptime % 3600) // 60
-    text = (
-        "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-        "┃  👑 <b>لوحة الأدمن</b>\n"
-        "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-        "📊 <b>الإحصائيات:</b>\n"
-        f"├ 👥 المستخدمون: <b>{len(user_registry)}</b>\n"
-        f"├ 📦 المهام الكلية: <b>{stats['total_jobs']}</b>\n"
-        f"├ ✅ نجحت: <b>{stats['successful']}</b>\n"
-        f"├ ❌ فشلت: <b>{stats['failed']}</b>\n"
-        f"├ ⏳ في الطابور: <b>{len(queued_job_ids)}</b>\n"
-        f"├ 🔥 نشط الآن: <b>{len(active_users)}</b>\n"
-        f"└ ⏱️ مدة التشغيل: <b>{hours}h {minutes}m</b>\n"
-    )
-    try:
-        await callback.message.edit_text(text)
-    except Exception:
-        pass
-    await callback.answer("✅ تم التحديث")
-
-
-# ============================================================
-# استقبال الروابط
-# ============================================================
 @dp.message(F.text.startswith("http"))
 async def handle_url(message: Message):
     uid = message.from_user.id
     username = message.from_user.username or "dzakt"
     url = message.text.strip()
 
-    register_user(uid, username)
-
     if not is_valid_google_sso_url(url):
         await message.answer(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "┃  ⚠️ <b>رابط غير صالح</b>\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            f"يجب إرسال الرابط من:\n<a href='{GOOGLE_LAB_URL}'>{GOOGLE_LAB_URL}</a>"
+            "⚠️ <b>رابط غير صالح!</b>\n\n"
+            "يرجى إرسال الرابط الصحيح من:\n"
+            "https://www.skills.google/focuses/33353?parent=catalog",
+            disable_web_page_preview=True
         )
         try:
             await message.delete()
@@ -1675,6 +1617,7 @@ async def handle_url(message: Message):
         except Exception:
             pass
 
+    # يقبل أكثر من رابط من المستخدم نفسه؛ كل رابط عنصر مستقل في الطابور.
     item = QueueItem(
         job_id=next(job_ids),
         user_id=uid,
@@ -1689,20 +1632,14 @@ async def handle_url(message: Message):
 
     if position and position > 1:
         await message.answer(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "┃  📥 <b>تم الاستلام</b>\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            f"🔢 رقم المهمة: <b>#{item.job_id}</b>\n"
-            f"📍 مكانك: <b>{position}</b>\n\n"
-            "♾️ أرسل ما تشاء من الروابط"
+            f"📥 تم استلام الرابط رقم <b>{item.job_id}</b>! "
+            f"مكانه في الطابور: <b>{position}</b>\n"
+            "يمكنك إرسال رابط آخر وسيُضاف بعده تلقائياً."
         )
     else:
         await message.answer(
-            "╭━━━━━━━━━━━━━━━━━━━━╮\n"
-            "┃  📥 <b>تم الاستلام</b>\n"
-            "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
-            f"🔢 رقم المهمة: <b>#{item.job_id}</b>\n"
-            "⚙️ سيبدأ التنفيذ فوراً…"
+            f"📥 تم استلام الرابط رقم <b>{item.job_id}</b> وسيبدأ الآن.\n"
+            "يمكنك إرسال رابط آخر وسيُضاف إلى الطابور تلقائياً."
         )
 
 
@@ -1710,7 +1647,6 @@ async def handle_url(message: Message):
 async def handle_input(message: Message):
     uid = message.from_user.id
     if uid not in url_sessions:
-        await message.answer("ℹ️ <b>لم تبدأ أي مهمة بعد</b>\nأرسل رابط Google SSO للبدء.")
         return
 
     s = url_sessions[uid]
@@ -1724,17 +1660,21 @@ async def handle_input(message: Message):
 
     if stage in ("password", "captcha", "2fa"):
         if await submit_value(page, value, stage):
-            names = {"password": "كلمة المرور", "captcha": "CAPTCHA", "2fa": "كود 2FA"}
-            await message.answer(f"✅ <b>تم إرسال {names[stage]}</b>")
+            await message.answer(f"✅ تم الإرسال ({stage})")
         else:
-            await take_screenshot_and_send(page, bot, uid, f"⚠️ فشل الإرسال: {stage}")
+            await take_screenshot_and_send(
+                page, bot, uid,
+                f"⚠️ فشل الإرسال في مرحلة: {stage}"
+            )
     else:
-        await take_screenshot_and_send(page, bot, uid, f"ℹ️ المرحلة: <code>{stage}</code>")
+        await take_screenshot_and_send(
+            page, bot, uid,
+            f"⚠️ المرحلة الحالية: <code>{stage}</code>"
+        )
 
 
 async def main():
-    print("🤖 البوت شغال…")
-    print(f"👑 الأدمن: {ADMIN_ID}")
+    print("🤖 البوت شغال...")
     asyncio.create_task(queue_worker())
     await dp.start_polling(bot)
 
