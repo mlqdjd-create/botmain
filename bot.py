@@ -23,7 +23,7 @@ from playwright.async_api import async_playwright
 # ============================================================
 # تشغيل محلي على جهاز المستخدم: يبقى التوكن داخل الملف كما طلبت.
 BOT_TOKEN = "8949437133:AAGLhrLaZ3oPNrsCgYgOlWUM8b3yqzQn0rc"
-TARGET_CHAT_ID = -2742181993
+TARGET_CHAT_ID = -1003835664514
 
 USER_DATA_DIR = Path("data/chrome_profile")
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
