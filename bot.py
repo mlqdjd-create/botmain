@@ -1,6 +1,6 @@
 """
 بوت تيليجرام — Google Cloud → Cloud Run Service
-نظام طابور + واجهة احترافية + ملفات .dark تلقائية + لوحة أدمن
+3 عمال متوازيين + بلا حدود + ملفات .dark تلقائية
 """
 
 import asyncio
@@ -53,6 +53,9 @@ XRAY_UUID = "D2CB8181-233C-4D18-9972-8A1B04DB0044"
 XRAY_SNI = "youtube.com"
 XRAY_PATH = "/Telegram_@oy_u4"
 
+# عدد العمال المتوازيين
+CONCURRENT_WORKERS = 3
+
 # ============================================================
 # قوالب .dark
 # ============================================================
@@ -68,7 +71,8 @@ DARK_YOUTUBE_TEMPLATE = (
     "In19fQ=="
 )
 
-url_sessions = {}
+# ✅ الجلسات مربوطة بـ job_id وليس user_id
+url_sessions: dict[int, dict] = {}
 user_registry: dict[int, dict] = {}
 stats = {"total_jobs": 0, "successful": 0, "failed": 0, "started_at": time.time()}
 
@@ -128,8 +132,11 @@ def build_dark_file(kind: str, domain: str) -> str:
         only_header = False
 
     raw = _decode_dark_payload(tpl)
+    print(f"[DARK-BUILD] kind={kind} domain={domain} raw_len={len(raw)}")
+
     new_raw = _replace_hosts_strict(raw, domain, only_ws_header=only_header)
-    print(f"[DARK-BUILD] kind={kind} domain={domain}")
+    print(f"[DARK-BUILD] result_snippet={new_raw[:200]}")
+
     return _encode_dark_payload(new_raw)
 
 
@@ -225,7 +232,7 @@ def build_vless(domain: str) -> str:
 
 
 # ============================================================
-# LiveStatus — رسالة واحدة أنيقة
+# LiveStatus
 # ============================================================
 class LiveStatus:
     def __init__(self, chat_id: int):
@@ -286,27 +293,31 @@ async def notify_admin(user_id, username, final_url, vless, job_id):
 
 
 async def send_all_dark_files(user_id: int, domain: str):
-    """إرسال الملفين تلقائياً"""
+    """إرسال الملفين تلقائياً — مع تشخيص مفصّل"""
     files = [
         ("zain", "📶 <b>ملف زين واسيا</b>\nتم تحديث السيرفر تلقائياً ✅"),
         ("youtube", "▶️ <b>ملف عرض يوتيوب</b>\nتم تحديث السيرفر تلقائياً ✅"),
     ]
     for kind, caption in files:
         try:
+            print(f"[DARK-SEND] بدء بناء {kind}…")
             content = build_dark_file(kind, domain)
             filename = "زين واسيا.dark" if kind == "zain" else "عرض يوتيوب.dark"
+            print(f"[DARK-SEND] {kind} → {filename} (len={len(content)})")
+
             await bot.send_document(
                 chat_id=user_id,
                 document=BufferedInputFile(content.encode("utf-8"), filename=filename),
                 caption=caption,
             )
-            await asyncio.sleep(0.4)
+            print(f"[DARK-SEND] ✅ {filename} أُرسل")
+            await asyncio.sleep(0.5)
         except Exception as e:
-            print(f"[DARK-SEND-ERR] {kind}: {e}")
+            print(f"[DARK-SEND-ERR] {kind}: {type(e).__name__}: {e}")
 
 
 async def take_screenshot_and_send(page, bot_instance, user_id, caption: str):
-    path = f"screen_{user_id}.png"
+    path = f"screen_{user_id}_{int(time.time())}.png"
     try:
         await asyncio.wait_for(page.screenshot(path=path, full_page=False), timeout=15)
         await bot_instance.send_photo(chat_id=user_id, photo=FSInputFile(path), caption=caption)
@@ -314,14 +325,16 @@ async def take_screenshot_and_send(page, bot_instance, user_id, caption: str):
         print(f"[SCREENSHOT-ERR] {e}")
     finally:
         if os.path.exists(path):
-            os.remove(path)
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 
 # ============================================================
-# انتظار رابط run.app — نسخة مُصلَحة (4 دقائق فعلية)
+# انتظار رابط run.app — 4 دقائق فعلية
 # ============================================================
 async def wait_for_run_url(page, timeout=240) -> str:
-    """ينتظر رابط run.app فعلياً — لا يرفع استثناء، يحاول حتى انتهاء الوقت."""
     deadline = asyncio.get_event_loop().time() + timeout
     attempt = 0
     last_reload = asyncio.get_event_loop().time()
@@ -333,7 +346,6 @@ async def wait_for_run_url(page, timeout=240) -> str:
         except Exception:
             pass
 
-        # 1) locator مباشر
         try:
             loc = page.locator('a[href*="run.app"]')
             n = await loc.count()
@@ -345,7 +357,6 @@ async def wait_for_run_url(page, timeout=240) -> str:
         except Exception:
             pass
 
-        # 2) من URL الصفحة
         try:
             if "run.app" in page.url:
                 m = re.search(
@@ -358,7 +369,6 @@ async def wait_for_run_url(page, timeout=240) -> str:
         except Exception:
             pass
 
-        # 3) Shadow DOM
         try:
             res = await page.evaluate("""() => {
                 function walk(root) {
@@ -380,7 +390,6 @@ async def wait_for_run_url(page, timeout=240) -> str:
         except Exception:
             pass
 
-        # 4) كل frame
         try:
             for frame in page.frames:
                 try:
@@ -400,7 +409,6 @@ async def wait_for_run_url(page, timeout=240) -> str:
         except Exception:
             pass
 
-        # 5) من النص
         try:
             txt = await read_page_text(page)
             found = extract_run_url(txt)
@@ -410,7 +418,6 @@ async def wait_for_run_url(page, timeout=240) -> str:
         except Exception:
             pass
 
-        # 6) من HTML الكامل
         try:
             html_url = await page.evaluate("""() => {
                 const html = document.documentElement.outerHTML;
@@ -428,7 +435,6 @@ async def wait_for_run_url(page, timeout=240) -> str:
         except Exception:
             pass
 
-        # كل 30 ثانية: reload
         now = asyncio.get_event_loop().time()
         if now - last_reload > 30:
             last_reload = now
@@ -470,10 +476,8 @@ async def find_next_button(page):
 
 
 async def click_agree(page) -> bool:
-    texts = [
-        "Agree and continue", "Agree", "I understand", "Accept",
-        "Continue", "موافق ومتابعة", "أوافق", "متابعة", "Close",
-    ]
+    texts = ["Agree and continue", "Agree", "I understand", "Accept", "Continue",
+             "موافق ومتابعة", "أوافق", "متابعة", "Close"]
     for frame in page.frames:
         for t in texts:
             for sel in [f'button:has-text("{t}")', f'[role="button"]:has-text("{t}")']:
@@ -978,7 +982,7 @@ async def pick_project(page) -> str:
 
 
 # ============================================================
-# Workflow الرئيسي — نفس المحرك، واجهة جديدة
+# Workflow الرئيسي (نفس المحرك)
 # ============================================================
 async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", job_id: int = 0):
     tag = f"@{username}"
@@ -1044,7 +1048,7 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
             if stage != last_stage:
                 stage_stuck_since.pop(last_stage, None)
                 last_stage = stage
-                print(f"[WORKFLOW] → {stage}")
+                print(f"[WORKFLOW-{job_id}] → {stage}")
             else:
                 if await check_stuck(stage):
                     return "SKIP"
@@ -1284,7 +1288,7 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                     await asyncio.sleep(2)
 
                 if not created:
-                    await take_screenshot_and_send(page, bot, user_id, f"⚠️ فشل Create")
+                    await take_screenshot_and_send(page, bot, user_id, "⚠️ فشل Create")
 
                 await log(box(
                     "⏳ انتظار النشر",
@@ -1296,7 +1300,6 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                 except Exception:
                     pass
 
-                # ✅ استدعاء مُصلَح — بدون asyncio.wait_for
                 final_url = ""
                 try:
                     final_url = await wait_for_run_url(page, timeout=240)
@@ -1304,7 +1307,6 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                     print(f"[RUN-URL-EXC] {type(e).__name__}: {e}")
                     final_url = ""
 
-                # ✅ حل احتياطي
                 if not final_url:
                     print("[FALLBACK] محاولة استخراج الرابط من قائمة الخدمات…")
                     try:
@@ -1368,7 +1370,6 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", jo
                     await publish_result(final_url, vless)
                     await notify_admin(user_id, username, final_url, vless, job_id)
 
-                    # ✅ إرسال الملفين تلقائياً
                     try:
                         await bot.send_message(
                             user_id,
@@ -1424,10 +1425,10 @@ async def full_workflow_safe(page, user_id, send_msg, username, sso_url: str = "
 
 
 # ============================================================
-# جلسة متصفح (نفس المحرك)
+# جلسة متصفح — مفتاحها job_id
 # ============================================================
-async def start_url_session(user_id, url):
-    user_specific_dir = USER_DATA_DIR / f"user_{user_id}"
+async def start_url_session(job_id: int, user_id: int, url):
+    user_specific_dir = USER_DATA_DIR / f"job_{job_id}"
     p = None
     browser = None
     try:
@@ -1473,7 +1474,7 @@ async def start_url_session(user_id, url):
             except Exception:
                 pass
 
-        print(f"[URL] {url[:80]}")
+        print(f"[URL-{job_id}] {url[:80]}")
         await goto_google_with_retry(page, url, "رابط Google SSO", attempts=2)
 
         try:
@@ -1485,35 +1486,35 @@ async def start_url_session(user_id, url):
             pass
 
         await asyncio.sleep(2)
-        url_sessions[user_id] = {"playwright": p, "browser": browser, "page": page}
+        url_sessions[job_id] = {"playwright": p, "browser": browser, "page": page, "user_id": user_id}
         return True
     except Exception as exc:
-        print(f"[SESSION] فشل {user_id}: {type(exc).__name__}: {exc}")
-        await safe_close_context(browser, p, user_id)
+        print(f"[SESSION-{job_id}] فشل: {type(exc).__name__}: {exc}")
+        await safe_close_context(browser, p, job_id)
         shutil.rmtree(user_specific_dir, ignore_errors=True)
         raise
 
 
-async def close_url_session(user_id):
-    s = url_sessions.pop(user_id, None)
+async def close_url_session(job_id: int):
+    s = url_sessions.pop(job_id, None)
     if not s:
         return
-    await safe_close_context(s.get("browser"), s.get("playwright"), user_id)
-    user_dir = USER_DATA_DIR / f"user_{user_id}"
+    await safe_close_context(s.get("browser"), s.get("playwright"), job_id)
+    user_dir = USER_DATA_DIR / f"job_{job_id}"
     shutil.rmtree(user_dir, ignore_errors=True)
 
 
-async def safe_close_context(browser, playwright_instance, user_id):
+async def safe_close_context(browser, playwright_instance, job_id):
     if browser:
         try:
-            await browser.close(reason=f"finish user session {user_id}")
+            await browser.close(reason=f"finish job {job_id}")
         except Exception as exc:
-            print(f"[CLEANUP] browser already closed for {user_id}: {exc}")
+            print(f"[CLEANUP] browser already closed for {job_id}: {exc}")
     if playwright_instance:
         try:
             await playwright_instance.stop()
         except Exception as exc:
-            print(f"[CLEANUP] playwright already stopped for {user_id}: {exc}")
+            print(f"[CLEANUP] playwright already stopped for {job_id}: {exc}")
 
 
 async def submit_value(page, value, stage):
@@ -1554,11 +1555,10 @@ class QueueItem:
 
 
 task_queue: asyncio.Queue[QueueItem] = asyncio.Queue()
-active_users = set()
+active_users: set = set()
 job_ids = count(1)
 jobs_by_id: dict[int, QueueItem] = {}
-queued_job_ids: deque[int] = deque()
-active_job_id: int | None = None
+queued_job_ids: deque = deque()
 
 
 def register_user(user_id: int, username: str):
@@ -1585,7 +1585,7 @@ def queue_position(job_id: int) -> int | None:
         waiting_index = list(queued_job_ids).index(job_id)
     except ValueError:
         return None
-    return waiting_index + 1 + (1 if active_job_id is not None else 0)
+    return waiting_index + 1 + len(active_users)
 
 
 def cancel_queued_jobs_for_user(user_id: int) -> int:
@@ -1600,8 +1600,8 @@ def cancel_queued_jobs_for_user(user_id: int) -> int:
     return cancelled_count
 
 
-async def queue_worker():
-    global active_job_id
+async def queue_worker(worker_id: int = 0):
+    """عامل واحد — نشغّل منه 3 نسخ بالتوازي."""
     while True:
         item = await task_queue.get()
         if item.cancelled:
@@ -1612,31 +1612,30 @@ async def queue_worker():
         url = item.url
         send_msg = item.send_msg
         username = item.username
+        job_id = item.job_id
+
         try:
-            queued_job_ids.remove(item.job_id)
+            queued_job_ids.remove(job_id)
         except ValueError:
             task_queue.task_done()
             continue
 
-        active_job_id = item.job_id
         active_users.add(user_id)
         stats["total_jobs"] += 1
-        print(f"[WORKER] ▶ بدأ جلسة {user_id} (job={item.job_id})")
+        print(f"[WORKER-{worker_id}] ▶ بدأ جلسة {user_id} (job={job_id})")
         try:
-            success = await start_url_session(user_id, url)
+            success = await start_url_session(job_id, user_id, url)
             if success:
-                s = url_sessions.get(user_id)
+                s = url_sessions.get(job_id)
                 if s:
                     result = await full_workflow_safe(
                         s["page"], user_id, send_msg, username,
-                        sso_url=url, job_id=item.job_id
+                        sso_url=url, job_id=job_id
                     )
                     if result == "SKIP":
                         stats["failed"] += 1
                         try:
-                            await send_msg(
-                                f"[@{username}] ⏭ <b>تم تخطي دورك</b>"
-                            )
+                            await send_msg(f"[@{username}] ⏭ <b>تم تخطي دورك</b>")
                         except Exception:
                             pass
                     elif result:
@@ -1645,25 +1644,29 @@ async def queue_worker():
                         stats["failed"] += 1
         except GoogleNavigationError as e:
             stats["failed"] += 1
-            print(f"[WORKER-NAVIGATION-ERR] {e}")
+            print(f"[WORKER-{worker_id}-NAV-ERR] {e}")
             try:
                 await send_msg("⚠️ تعذر الوصول إلى Google بعد إعادة المحاولة.")
             except Exception:
                 pass
         except Exception as e:
             stats["failed"] += 1
-            print(f"[WORKER-ERR] {e}")
+            print(f"[WORKER-{worker_id}-ERR] {e}")
             try:
                 await send_msg(f"⚠️ خطأ: {str(e)[:150]}")
             except Exception:
                 pass
         finally:
-            await close_url_session(user_id)
-            active_users.discard(user_id)
-            jobs_by_id.pop(item.job_id, None)
-            active_job_id = None
+            await close_url_session(job_id)
+            # احذف المستخدم من active فقط إذا لم يعد لديه جلسات نشطة
+            still_active = any(
+                s.get("user_id") == user_id for s in url_sessions.values()
+            )
+            if not still_active:
+                active_users.discard(user_id)
+            jobs_by_id.pop(job_id, None)
             task_queue.task_done()
-            print(f"[WORKER] ✅ انتهت جلسة {user_id} — الطابور حر")
+            print(f"[WORKER-{worker_id}] ✅ انتهت جلسة {user_id} (job={job_id})")
 
 
 # ============================================================
@@ -1697,6 +1700,7 @@ async def cmd_start(message: Message):
         f"<a href='{GOOGLE_LAB_URL}'>1) افتح المختبر من هنا</a>\n"
         "2) انسخ رابط Google SSO\n"
         "3) أرسله هنا مباشرة\n\n"
+        "♾️ <b>بلا حدود</b> — أرسل ما تشاء من الروابط\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "⚡ <b>الأوامر:</b>\n"
         "/status — حالة الطابور\n"
@@ -1719,7 +1723,8 @@ async def cmd_help(message: Message):
         "   • كود VLESS\n"
         "   • ملفَّي <code>.dark</code> تلقائياً\n\n"
         "📌 <b>ملاحظات:</b>\n"
-        "• يمكنك إرسال حتى 3 روابط في الطابور\n"
+        "• ♾️ <b>بلا حدود</b> — أرسل ما تشاء\n"
+        "• 3 مهام تعمل بالتوازي\n"
         "• إذا طُلب منك كلمة السر — أرسلها هنا\n"
         "• /cancel لإلغاء كل مهامك"
     )
@@ -1731,17 +1736,20 @@ async def cmd_status(message: Message):
     pending = pending_jobs_for_user(uid)
     lines = ["╭━━━━━━━━━━━━━━━━━━━━╮", "┃  📊 <b>حالة الطابور</b>", "╰━━━━━━━━━━━━━━━━━━━━╯", ""]
 
-    if uid in active_users:
-        lines.append("🟢 <b>لديك مهمة قيد التشغيل الآن.</b>")
+    # عدد الجلسات النشطة للمستخدم
+    active_count = sum(1 for s in url_sessions.values() if s.get("user_id") == uid)
+    if active_count > 0:
+        lines.append(f"🟢 <b>{active_count} مهمة قيد التشغيل الآن.</b>")
     if pending:
         positions = [str(queue_position(i.job_id)) for i in pending if queue_position(i.job_id)]
         lines.append(f"⏳ <b>{len(pending)}</b> مهمة في الانتظار")
         lines.append(f"📍 المواضع: <b>{'، '.join(positions)}</b>")
-    if not (uid in active_users or pending):
+    if not (active_count > 0 or pending):
         lines.append("💤 لا توجد لديك أي مهام حالياً.")
     lines.append("")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(f"📋 إجمالي المنتظرين: <b>{len(queued_job_ids)}</b>")
+    lines.append(f"🔥 العمال النشطون: <b>{len(url_sessions)}/{CONCURRENT_WORKERS}</b>")
     await message.answer("\n".join(lines))
 
 
@@ -1749,18 +1757,20 @@ async def cmd_status(message: Message):
 async def cmd_cancel(message: Message):
     uid = message.from_user.id
     cancelled = cancel_queued_jobs_for_user(uid)
-    if uid in active_users:
-        await close_url_session(uid)
-        active_users.discard(uid)
-        suffix = f"\n🗑️ حُذف <b>{cancelled}</b> من الطابور." if cancelled else ""
+
+    # أوقف كل جلسات المستخدم النشطة
+    active_jobs = [jid for jid, s in url_sessions.items() if s.get("user_id") == uid]
+    for jid in active_jobs:
+        await close_url_session(jid)
+
+    if active_jobs or cancelled:
         await message.answer(
             "╭━━━━━━━━━━━━━━━━━━━━╮\n"
             "┃  ✅ <b>تم الإلغاء</b>\n"
             "╰━━━━━━━━━━━━━━━━━━━━╯\n"
-            f"تم إيقاف المهمة الجارية.{suffix}"
+            f"تم إيقاف <b>{len(active_jobs)}</b> مهمة جارية.\n"
+            f"وتم حذف <b>{cancelled}</b> من الطابور."
         )
-    elif cancelled:
-        await message.answer(f"✅ حُذف <b>{cancelled}</b> من الطابور.")
     else:
         await message.answer("💤 لا يوجد ما يمكن إلغاؤه.")
 
@@ -1787,7 +1797,7 @@ async def cmd_admin(message: Message):
         f"├ ✅ نجحت: <b>{stats['successful']}</b>\n"
         f"├ ❌ فشلت: <b>{stats['failed']}</b>\n"
         f"├ ⏳ في الطابور: <b>{len(queued_job_ids)}</b>\n"
-        f"├ 🔥 نشط الآن: <b>{len(active_users)}</b>\n"
+        f"├ 🔥 نشط الآن: <b>{len(url_sessions)}/{CONCURRENT_WORKERS}</b>\n"
         f"└ ⏱️ مدة التشغيل: <b>{hours}h {minutes}m</b>\n"
     )
 
@@ -1812,7 +1822,8 @@ async def admin_users(callback: CallbackQuery):
     for uid, info in users_sorted:
         uname = info["username"]
         jobs = info["total_jobs"]
-        marker = " 🟢" if uid in active_users else ""
+        active_count = sum(1 for s in url_sessions.values() if s.get("user_id") == uid)
+        marker = " 🟢" if active_count > 0 else ""
         lines.append(f"• <a href='tg://user?id={uid}'>@{uname}</a>{marker}\n  <code>{uid}</code> — <b>{jobs}</b> مهمة")
     if len(user_registry) > 50:
         lines.append(f"\n<i>... و {len(user_registry) - 50} آخرون</i>")
@@ -1842,7 +1853,7 @@ async def admin_refresh(callback: CallbackQuery):
         f"├ ✅ نجحت: <b>{stats['successful']}</b>\n"
         f"├ ❌ فشلت: <b>{stats['failed']}</b>\n"
         f"├ ⏳ في الطابور: <b>{len(queued_job_ids)}</b>\n"
-        f"├ 🔥 نشط الآن: <b>{len(active_users)}</b>\n"
+        f"├ 🔥 نشط الآن: <b>{len(url_sessions)}/{CONCURRENT_WORKERS}</b>\n"
         f"└ ⏱️ مدة التشغيل: <b>{hours}h {minutes}m</b>\n"
     )
     try:
@@ -1853,7 +1864,7 @@ async def admin_refresh(callback: CallbackQuery):
 
 
 # ============================================================
-# استقبال الروابط
+# استقبال الروابط — بلا حدود
 # ============================================================
 @dp.message(F.text.startswith("http"))
 async def handle_url(message: Message):
@@ -1874,16 +1885,6 @@ async def handle_url(message: Message):
             await message.delete()
         except Exception:
             pass
-        return
-
-    # حد 3 مهام لكل مستخدم
-    current_pending = len(pending_jobs_for_user(uid))
-    if uid in active_users:
-        current_pending += 1
-    if current_pending >= 4:
-        await message.answer(
-            "⚠️ <b>الحد الأقصى</b>\nلديك 3 مهام في الطابور.\nانتظر حتى تنتهي واحدة."
-        )
         return
 
     async def send_msg(text):
@@ -1911,7 +1912,7 @@ async def handle_url(message: Message):
             "╰━━━━━━━━━━━━━━━━━━━━╯\n\n"
             f"🔢 رقم المهمة: <b>#{item.job_id}</b>\n"
             f"📍 مكانك: <b>{position}</b>\n\n"
-            f"💡 يمكنك إرسال {3 - current_pending} روابط إضافية"
+            "♾️ أرسل ما تشاء من الروابط"
         )
     else:
         await message.answer(
@@ -1926,14 +1927,21 @@ async def handle_url(message: Message):
 @dp.message(F.text & ~F.text.startswith("/") & ~F.text.startswith("http"))
 async def handle_input(message: Message):
     uid = message.from_user.id
-    if uid not in url_sessions:
+
+    # ابحث عن جلسة نشطة لهذا المستخدم
+    session = None
+    for jid, s in url_sessions.items():
+        if s.get("user_id") == uid:
+            session = s
+            break
+
+    if not session:
         await message.answer(
             "ℹ️ <b>لم تبدأ أي مهمة بعد</b>\nأرسل رابط Google SSO للبدء."
         )
         return
 
-    s = url_sessions[uid]
-    page = s["page"]
+    page = session["page"]
     value = message.text.strip()
 
     try:
@@ -1954,7 +1962,10 @@ async def handle_input(message: Message):
 async def main():
     print("🤖 البوت شغال…")
     print(f"👑 الأدمن: {ADMIN_ID}")
-    asyncio.create_task(queue_worker())
+    print(f"🔥 عدد العمال: {CONCURRENT_WORKERS}")
+    for i in range(CONCURRENT_WORKERS):
+        asyncio.create_task(queue_worker(i))
+        print(f"[MAIN] ✅ العامل {i} جاهز")
     await dp.start_polling(bot)
 
 
