@@ -1,9 +1,12 @@
 """
 بوت تيليجرام — Google Cloud → Cloud Run Service
 نظام طابور لمعالجة الروابط بالتتابع
++ أزرار اختيار نوع الملف + إحصائيات للأدمن + ملفات .dark ديناميكية
 """
 
 import asyncio
+import base64
+import json
 import os
 import re
 import shutil
@@ -15,15 +18,22 @@ from itertools import count
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, FSInputFile
+from aiogram.types import (
+    Message,
+    FSInputFile,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    BufferedInputFile,
+)
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from playwright.async_api import async_playwright
 
 # ============================================================
-# تشغيل محلي على جهاز المستخدم: يبقى التوكن داخل الملف كما طلبت.
 BOT_TOKEN = "8949437133:AAGLhrLaZ3oPNrsCgYgOlWUM8b3yqzQn0rc"
 TARGET_CHAT_ID = -2742181993
+ADMIN_ID = 6603530067
 
 USER_DATA_DIR = Path("data/chrome_profile")
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -38,9 +48,26 @@ CR_MAX = "8"
 
 XRAY_UUID = "D2CB8181-233C-4D18-9972-8A1B04DB0044"
 XRAY_SNI = "youtube.com"
-
-# ✅ المسار الجديد الذي سيُرسل في تكوين VLESS
 XRAY_PATH = "/Telegram_@oy_u4"
+
+# قوالب ملفات .dark — يتم استبدال host + wsHeaderHost بالدومين الجديد
+DARK_ZAIN_TEMPLATE = (
+    "darktunnel://eyJ0eXBlIjoiVkxFU1MiLCJuYW1lIjoiR0NQLXVzLWNlbnRyYWwxIiwidmxlc3NUdW5uZWxDb25maWciOnsidjJyYXlDb25maWciOnsiaG9zdCI6"
+    "a2VzaGFrYW55ZmFjZWJvb2suYmxvZ3Nwb3QuY29tIiwicG9ydCI6NDQzLCJ1dWlkIjoiRDJDQjgxODEtMjMzQy00RDE4LTk5NzItOEExQjA0REIwMDQ0Iiwic2VydmVyTmFtZUluZGljYXRpb24iOiJrZXNoYWthbnlmYWNlYm9vay5ibG9nc3BvdC5jb20iLCJ3c1BhdGgiOiIvVGVsZWdyYW1fQG95X3U0Iiwid3NIZWFkZXJIb3N0Ijoi"
+    "v2ray-737534492008.us-central1.run.app"
+    "In0sImluamVjdENvbmZpZyI6eyJlbmFibGVkIjp0cnVlLCJtb2RlIjoiUFJPWFkiLCJzZXJ2ZXJOYW1lSW5kaWNhdGlvbiI6Imtlc2hha2FueWZhY2Vib29rLmJsb2dzcG90LmNvbSIsInByb3h5SG9zdCI6IjMxLjEzLjgzLjM5IiwicGF5bG9hZCI6IkNPTk5FQ1QgW2hvc3RdOltwb3J0XSBIVFRQLzEuMVtjcmxmXXgtY29ubmVjdGVkLXRvOiAzNC4xNDMuNzIuMltjcmxmXXByb3h5LWNvbm5lY3Rpb246IGtlZXAtYWxpdmVbY3JsZl1jb25uZWN0aW9uOiBrZWVwLWFsaXZlW2NybGZddXNlci1hZ2VudDogRkJBVi8wLjAgW2NybGZdeC1pb3JnLWJzaWQ6IEBveV91NGpbY3JsZl1bY3JsZl0ifX19"
+)
+
+DARK_YOUTUBE_TEMPLATE = (
+    "darktunnel://eyJ0eXBlIjoiVkxFU1MiLCJuYW1lIjoiR0NQLVhyYXkiLCJ2bGVzc1R1bm5lbENvbmZpZyI6eyJ2MnJheUNvbmZpZyI6eyJob3N0Ijoi"
+    "v2ray-779998501920.us-central1.run.app"
+    "IiwicG9ydCI6NDQzLCJ1dWlkIjoiRDJDQjgxODEtMjMzQy00RDE4LTk5NzItOEExQjA0REIwMDQ0Iiwic2VydmVyTmFtZUluZGljYXRpb24iOiJ5b3V0dWJlLmNvbSIsIndzUGF0aCI6Ii9UZWxlZ3JhbV9Ab3lfdTQiLCJ3c0hlYWRlckhvc3QiOiI"
+    "v2ray-779998501920.us-central1.run.app"
+    "In19fQ=="
+)
+
+# ملفات العمل (queued) — user_id -> chosen file type
+user_choice: dict[int, str] = {}
 
 url_sessions = {}
 
@@ -52,6 +79,43 @@ Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
 window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: {} };
 """
 
+
+# ============================================================
+def _b64_replace_host(template: str, new_host: str) -> str:
+    """يستبدل الـ host القديم داخل بايلود base64 بذكاء"""
+    try:
+        prefix = "darktunnel://"
+        if not template.startswith(prefix):
+            return template
+        b64 = template[len(prefix):]
+        # padding
+        pad = (-len(b64)) % 4
+        b64_padded = b64 + ("=" * pad)
+        raw = base64.b64decode(b64_padded).decode("utf-8", errors="ignore")
+        # استبدال host + wsHeaderHost
+        raw = re.sub(
+            r'"host"\s*:\s*"[^"]*"',
+            f'"host": "{new_host}"',
+            raw,
+        )
+        raw = re.sub(
+            r'"wsHeaderHost"\s*:\s*"[^"]*"',
+            f'"wsHeaderHost": "{new_host}"',
+            raw,
+        )
+        new_b64 = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+        return prefix + new_b64
+    except Exception as e:
+        print(f"[DARK-B64-ERR] {e}")
+        return template
+
+
+def build_dark_file(kind: str, domain: str) -> str:
+    """يبني محتوى ملف .dark مع الدومين الجديد"""
+    tpl = DARK_ZAIN_TEMPLATE if kind == "zain" else DARK_YOUTUBE_TEMPLATE
+    return _b64_replace_host(tpl, domain)
+
+
 # ============================================================
 def is_valid_google_sso_url(url: str) -> bool:
     pattern = (
@@ -62,26 +126,17 @@ def is_valid_google_sso_url(url: str) -> bool:
 
 
 class GoogleNavigationError(RuntimeError):
-    """فشل الوصول إلى Google بعد إعادة المحاولات ضمن الجلسة نفسها."""
+    pass
 
 
 async def goto_google_with_retry(page, url: str, label: str, attempts: int = 3):
-    """يفتح صفحة Google دون اعتبار تأخر تحميل DOM فشلاً في التنقل.
-
-    Google SSO يمر بعدة تحويلات بين skills.google وaccounts.google، وقد يظل
-    DOM غير مكتمل مع أن التحويل وصل فعلاً. لذلك ننتظر بداية التحميل أولاً، ثم
-    نعيد المحاولة عند أخطاء الشبكة، بدلاً من إنهاء جلسة المستخدم فوراً.
-    """
     last_error = None
-
     for attempt in range(1, attempts + 1):
         try:
             await page.goto(url, wait_until="commit", timeout=75_000)
             try:
                 await page.wait_for_load_state("domcontentloaded", timeout=30_000)
             except Exception:
-                # بعض صفحات Google تتابع التحويل بعد commit؛ تتابع مرحلة الكشف
-                # لاحقاً بدلاً من فشل الجلسة بسبب انتظار DOM فقط.
                 pass
             print(f"[NAVIGATION] {label} نجح في المحاولة {attempt}")
             return
@@ -93,8 +148,6 @@ async def goto_google_with_retry(page, url: str, label: str, attempts: int = 3):
             )
             if attempt == attempts:
                 break
-
-            # إلغاء أي تحويل عالق قبل إعادة فتح نفس الرابط.
             try:
                 await page.goto("about:blank", wait_until="commit", timeout=5_000)
             except Exception:
@@ -150,7 +203,6 @@ def extract_run_url(text: str) -> str:
 
 def build_vless(domain: str) -> str:
     domain = domain.replace("https://", "").replace("http://", "").rstrip("/")
-    # ✅ ترميز المسار ليصبح صالحاً داخل رابط VLESS
     encoded_path = urllib.parse.quote(XRAY_PATH, safe="")
     return (
         f"vless://{XRAY_UUID}@{domain}:443"
@@ -176,6 +228,41 @@ async def publish_result(final_url: str, vless: str):
         print(f"[PUBLISH-ERR] {e}")
 
 
+async def notify_admin(
+    user_id: int,
+    username: str,
+    final_url: str,
+    vless: str,
+    job_id: int,
+    file_kind: str,
+):
+    """إرسال إشعار للأدمن مع كل رابط جديد + الإحصائيات"""
+    if not ADMIN_ID:
+        return
+    try:
+        kind_label = {
+            "zain": "زين واسيا 📶",
+            "youtube": "عرض يوتيوب ▶️",
+        }.get(file_kind, file_kind or "غير محدد")
+
+        text = (
+            "📊 <b>إحصائية رابط جديد</b>\n\n"
+            f"👤 المستخدم: <a href='tg://user?id={user_id}'>@{username}</a>\n"
+            f"🆔 الآيدي: <code>{user_id}</code>\n"
+            f"🔢 رقم المهمة: <b>{job_id}</b>\n"
+            f"📁 نوع الملف: <b>{kind_label}</b>\n\n"
+            f"🔗 <b>الرابط:</b>\n<code>{final_url}</code>\n\n"
+            f"📋 <b>VLESS:</b>\n<code>{vless}</code>"
+        )
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=text,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        print(f"[ADMIN-NOTIFY-ERR] {e}")
+
+
 async def take_screenshot_and_send(page, bot_instance, user_id, caption: str):
     path = f"screen_{user_id}.png"
     try:
@@ -196,15 +283,12 @@ async def take_screenshot_and_send(page, bot_instance, user_id, caption: str):
 
 
 # ============================================================
-# انتظار رابط run.app — 5 محاولات تشمل Shadow DOM
-# ============================================================
 async def wait_for_run_url(page, timeout=120) -> str:
     deadline = asyncio.get_event_loop().time() + timeout
 
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(2)
 
-        # محاولة 1: locator مباشر
         try:
             link_locator = page.locator('a[href*="run.app"]')
             count = await link_locator.count()
@@ -216,7 +300,6 @@ async def wait_for_run_url(page, timeout=120) -> str:
         except Exception:
             pass
 
-        # محاولة 2: من URL الصفحة
         try:
             url_now = page.url
             if "run.app" in url_now:
@@ -229,7 +312,6 @@ async def wait_for_run_url(page, timeout=120) -> str:
         except Exception:
             pass
 
-        # محاولة 3: JavaScript يخترق Shadow DOM
         try:
             result = await asyncio.wait_for(
                 page.evaluate("""() => {
@@ -257,7 +339,6 @@ async def wait_for_run_url(page, timeout=120) -> str:
         except Exception:
             pass
 
-        # محاولة 4: كل frame
         try:
             for frame in page.frames:
                 try:
@@ -280,7 +361,6 @@ async def wait_for_run_url(page, timeout=120) -> str:
         except Exception:
             pass
 
-        # محاولة 5: من نص الصفحة
         try:
             txt = await asyncio.wait_for(read_page_text(page), timeout=8)
             found = extract_run_url(txt)
@@ -292,8 +372,6 @@ async def wait_for_run_url(page, timeout=120) -> str:
     return ""
 
 
-# ============================================================
-# أدوات النقر والتعبئة
 # ============================================================
 async def find_next_button(page):
     texts = ["Next", "التالي", "Sign in", "Verify", "تحقق", "تسجيل الدخول"]
@@ -612,8 +690,6 @@ async def find_input(page, selectors):
 
 
 # ============================================================
-# نافذة الشروط
-# ============================================================
 async def has_cloud_consent(page) -> bool:
     try:
         for frame in page.frames:
@@ -656,9 +732,6 @@ async def handle_cloud_consent(page) -> bool:
     return False
 
 
-# ============================================================
-# تفعيل Cloud Run API
-# ============================================================
 async def enable_cloud_run_api(page, project_id: str, authuser: str) -> bool:
     api_url = (
         f"https://console.cloud.google.com/apis/library/run.googleapis.com"
@@ -693,9 +766,6 @@ async def enable_cloud_run_api(page, project_id: str, authuser: str) -> bool:
     return False
 
 
-# ============================================================
-# كشف المرحلة
-# ============================================================
 async def detect_stage(page) -> str:
     try:
         for frame in page.frames:
@@ -764,9 +834,6 @@ async def detect_stage(page) -> str:
     return "unknown"
 
 
-# ============================================================
-# اختيار المشروع
-# ============================================================
 async def is_project_selected(page) -> bool:
     try:
         for frame in page.frames:
@@ -859,9 +926,7 @@ async def pick_project(page) -> str:
 
 
 # ============================================================
-# Workflow الرئيسي
-# ============================================================
-async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
+async def full_workflow(page, user_id, send_msg, username, sso_url: str = "", job_id: int = 0):
     tag = f"@{username}"
     stage_stuck_since = {}
     STUCK_LIMIT = 180
@@ -1227,6 +1292,26 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
                         f"📋 <b>VLESS:</b>\n<code>{vless}</code>"
                     )
                     await publish_result(final_url, vless)
+
+                    # إشعار الأدمن بالإحصائية
+                    kind = user_choice.get(user_id, "")
+                    await notify_admin(
+                        user_id=user_id,
+                        username=username,
+                        final_url=final_url,
+                        vless=vless,
+                        job_id=job_id,
+                        file_kind=kind,
+                    )
+
+                    # إرسال ملف .dark إن اختار المستخدم نوعاً
+                    if kind:
+                        await send_dark_file_to_user(
+                            user_id=user_id,
+                            kind=kind,
+                            domain=domain,
+                        )
+
                     return final_url
                 else:
                     await log(f"[{tag}] ⏰ انتهى الوقت بدون رابط")
@@ -1250,14 +1335,36 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
         return ""
 
 
-# ============================================================
-# غلاف Timeout صارم 35 دقيقة
-# ============================================================
-async def full_workflow_safe(page, user_id, send_msg, username, sso_url: str = ""):
+async def send_dark_file_to_user(user_id: int, kind: str, domain: str):
+    """يبني ملف .dark بالدومين الجديد ويرسله للمستخدم"""
+    try:
+        content = build_dark_file(kind, domain)
+        if kind == "zain":
+            filename = "زين واسيا.dark"
+            caption = "📶 <b>ملف زين واسيا</b>\nتم تحديث السيرفر تلقائياً ✅"
+        else:
+            filename = "عرض يوتيوب.dark"
+            caption = "▶️ <b>ملف عرض يوتيوب</b>\nتم تحديث السيرفر تلقائياً ✅"
+
+        file = BufferedInputFile(
+            content.encode("utf-8"),
+            filename=filename,
+        )
+        await bot.send_document(
+            chat_id=user_id,
+            document=file,
+            caption=caption,
+        )
+        print(f"[DARK-FILE] ✅ تم إرسال {filename} للمستخدم {user_id}")
+    except Exception as e:
+        print(f"[DARK-FILE-ERR] {e}")
+
+
+async def full_workflow_safe(page, user_id, send_msg, username, sso_url: str = "", job_id: int = 0):
     tag = f"@{username}"
     try:
         result = await asyncio.wait_for(
-            full_workflow(page, user_id, send_msg, username, sso_url),
+            full_workflow(page, user_id, send_msg, username, sso_url, job_id),
             timeout=60 * 35
         )
         return result
@@ -1282,8 +1389,6 @@ async def full_workflow_safe(page, user_id, send_msg, username, sso_url: str = "
         return ""
 
 
-# ============================================================
-# ✅ جلسة متصفح محلية بدون بروكسي
 # ============================================================
 async def start_url_session(user_id, url):
     user_specific_dir = USER_DATA_DIR / f"user_{user_id}"
@@ -1367,7 +1472,6 @@ async def close_url_session(user_id):
 
 
 async def safe_close_context(browser, playwright_instance, user_id):
-    """إغلاق idempotent لا يرمي خطأ إذا أُغلقت الصفحة/السياق مسبقاً."""
     if browser:
         try:
             await browser.close(reason=f"finish user session {user_id}")
@@ -1426,7 +1530,6 @@ active_job_id: int | None = None
 
 
 def pending_jobs_for_user(user_id: int) -> list[QueueItem]:
-    """يعيد كل روابط المستخدم المنتظرة بالترتيب الذي ستعمل به."""
     return [
         jobs_by_id[job_id]
         for job_id in queued_job_ids
@@ -1435,7 +1538,6 @@ def pending_jobs_for_user(user_id: int) -> list[QueueItem]:
 
 
 def queue_position(job_id: int) -> int | None:
-    """موضع المهمة بين الجلسة الجارية والمهام المنتظرة، إن كانت لم تبدأ."""
     try:
         waiting_index = list(queued_job_ids).index(job_id)
     except ValueError:
@@ -1444,7 +1546,6 @@ def queue_position(job_id: int) -> int | None:
 
 
 def cancel_queued_jobs_for_user(user_id: int) -> int:
-    """يلغي كل الروابط التي لم تبدأ بعد، من دون العبث بطابور asyncio الداخلي."""
     cancelled_count = 0
     for job_id in list(queued_job_ids):
         item = jobs_by_id.get(job_id)
@@ -1471,7 +1572,6 @@ async def queue_worker():
         try:
             queued_job_ids.remove(item.job_id)
         except ValueError:
-            # يمكن أن يحدث فقط إذا أُلغي الرابط قبل أن يصله العامل.
             task_queue.task_done()
             continue
 
@@ -1484,7 +1584,8 @@ async def queue_worker():
                 s = url_sessions.get(user_id)
                 if s:
                     result = await full_workflow_safe(
-                        s["page"], user_id, send_msg, username, sso_url=url
+                        s["page"], user_id, send_msg, username,
+                        sso_url=url, job_id=item.job_id
                     )
                     if result == "SKIP":
                         try:
@@ -1516,6 +1617,51 @@ async def queue_worker():
             active_job_id = None
             task_queue.task_done()
             print(f"[WORKER] ✅ انتهت جلسة {user_id} — الطابور حر")
+
+
+# ============================================================
+# أزرار اختيار نوع الملف
+# ============================================================
+def get_kind_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📶 زين واسيا",
+                    callback_data=f"kind:zain:{user_id}",
+                ),
+                InlineKeyboardButton(
+                    text="▶️ عرض يوتيوب",
+                    callback_data=f"kind:youtube:{user_id}",
+                ),
+            ],
+        ]
+    )
+
+
+@dp.callback_query(F.data.startswith("kind:"))
+async def on_kind_choice(callback: CallbackQuery):
+    try:
+        _, kind, owner_id_str = callback.data.split(":", 2)
+        owner_id = int(owner_id_str)
+    except Exception:
+        await callback.answer("❌ بيانات غير صالحة", show_alert=True)
+        return
+
+    if callback.from_user.id != owner_id:
+        await callback.answer("⚠️ هذه الأزرار ليست لك.", show_alert=True)
+        return
+
+    user_choice[owner_id] = kind
+    label = "زين واسيا 📶" if kind == "zain" else "عرض يوتيوب ▶️"
+    try:
+        await callback.message.edit_text(
+            f"✅ تم اختيار: <b>{label}</b>\n"
+            f"سيتم إرسال ملف <code>.dark</code> لك بعد إنشاء الرابط.",
+        )
+    except Exception:
+        pass
+    await callback.answer(f"تم اختيار {label}")
 
 
 # ============================================================
@@ -1566,9 +1712,9 @@ async def cmd_status(message: Message):
     if not lines:
         lines.append("❌ لا توجد لديك أي مشاريع تعمل حالياً أو في الطابور.")
 
-    lines.extend([
+    lines.append(
         f"📋 إجمالي الروابط المنتظرة: <b>{len(queued_job_ids)}</b>",
-    ])
+    )
     await message.answer("\n".join(lines))
 
 
@@ -1611,42 +1757,37 @@ async def handle_url(message: Message):
             pass
         return
 
-    async def send_msg(text):
-        try:
-            await message.answer(text)
-        except Exception:
-            pass
-
-    # يقبل أكثر من رابط من المستخدم نفسه؛ كل رابط عنصر مستقل في الطابور.
-    item = QueueItem(
-        job_id=next(job_ids),
-        user_id=uid,
-        url=url,
-        send_msg=send_msg,
-        username=username,
+    # أولاً: يختار المستخدم نوع الملف
+    await message.answer(
+        "📁 <b>اختر نوع الملف الذي تريده:</b>\n\n"
+        "• 📶 زين واسيا\n"
+        "• ▶️ عرض يوتيوب\n\n"
+        "سيتم إرسال ملف <code>.dark</code> لك بعد إنشاء الرابط وتحديثه تلقائياً.",
+        reply_markup=get_kind_keyboard(uid),
     )
-    jobs_by_id[item.job_id] = item
-    queued_job_ids.append(item.job_id)
-    position = queue_position(item.job_id)
-    await task_queue.put(item)
 
-    if position and position > 1:
+
+@dp.message(F.document)
+async def handle_dark_upload(message: Message):
+    """استقبال ملفات .dark من المستخدم (اختياري)"""
+    doc = message.document
+    if doc and doc.file_name and doc.file_name.lower().endswith(".dark"):
         await message.answer(
-            f"📥 تم استلام الرابط رقم <b>{item.job_id}</b>! "
-            f"مكانه في الطابور: <b>{position}</b>\n"
-            "يمكنك إرسال رابط آخر وسيُضاف بعده تلقائياً."
-        )
-    else:
-        await message.answer(
-            f"📥 تم استلام الرابط رقم <b>{item.job_id}</b> وسيبدأ الآن.\n"
-            "يمكنك إرسال رابط آخر وسيُضاف إلى الطابور تلقائياً."
+            "ℹ️ تم استلام ملف <code>.dark</code>.\n"
+            "ملاحظة: البوت يقوم بتحديث الملف تلقائياً بعد إنشاء الرابط.",
         )
 
 
 @dp.message(F.text & ~F.text.startswith("/") & ~F.text.startswith("http"))
 async def handle_input(message: Message):
     uid = message.from_user.id
+
+    # إذا لم يكن في جلسة، نتحقق مما إذا كان يريد إرسال رابط
     if uid not in url_sessions:
+        await message.answer(
+            "📎 أرسل رابط Google SSO أولاً.\n"
+            "أو استخدم /start للتعليمات."
+        )
         return
 
     s = url_sessions[uid]
