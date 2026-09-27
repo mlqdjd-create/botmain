@@ -19,6 +19,7 @@ from aiogram.types import Message, FSInputFile
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from playwright.async_api import async_playwright
+import aiohttp
 
 # ============================================================
 # تشغيل محلي على جهاز المستخدم: يبقى التوكن داخل الملف كما طلبت.
@@ -41,6 +42,21 @@ XRAY_SNI = "youtube.com"
 
 # ✅ المسار الجديد الذي سيُرسل في تكوين VLESS
 XRAY_PATH = "/Telegram_@oy_u4"
+
+# ============================================================
+# ✅ ربط البوت بباك إند التطبيق (AHMED VPN):
+# كل رابط صحيح ينشئه أي شخص عبر البوت يُرفع تلقائياً للباك إند،
+# وتطبيقات المستخدمين تسحبه بالمزامنة الخلفية الصامتة
+# (بدون زر تحديث وبدون أي إشعار يظهر لهم).
+# ============================================================
+BACKEND_API_URL = "https://ahmedvpnh-production.up.railway.app/api/servers"
+# ⚠️ غيّر هذه القيمة إذا كانت ADMIN_API_KEY على Railway مختلفة
+BACKEND_ADMIN_KEY = "ahmed_vpn_admin_secret_key_2026"
+
+# ✅ أسماء السيرفرات في الباك إند التي تُحدَّث بصمت عند كل رابط جديد
+# (بدون إضافة أي سيرفر جديد — تحديث فقط لسيرفرات موجودة مسبقاً).
+# مثال: BACKEND_UPDATE_NAMES = ["GCP-Xray 1", "GCP-Xray 2"]
+BACKEND_UPDATE_NAMES = []
 
 url_sessions = {}
 
@@ -176,6 +192,55 @@ async def publish_result(final_url: str, vless: str):
         print(f"[PUBLISH-ERR] {e}")
 
 
+async def update_designated_servers(vless: str, domain: str) -> list:
+    """يحدّث السيرفرات المعينة فقط في الباك إند (بدون إضافة أي سيرفر جديد):
+    يستبدل رابط السيرفر المعين بالرابط الجديد — والتحديث يصل تطبيقات
+    المستخدمين بصمت حتى لو كان التطبيق مغلقاً (مزامنة خلفية).
+
+    ترجع قائمة بأسماء السيرفرات التي تم تحديثها فعلاً."""
+    updated = []
+    if not BACKEND_UPDATE_NAMES or not BACKEND_API_URL or not BACKEND_ADMIN_KEY:
+        print("[BACKEND-UPDATE] لم يتم تعيين BACKEND_UPDATE_NAMES — تخطي التحديث")
+        return updated
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                BACKEND_API_URL,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    print(f"[BACKEND-UPDATE] فشل جلب القائمة ({resp.status})")
+                    return updated
+                data = await resp.json(content_type=None)
+
+            for srv in data.get("servers", []):
+                name = srv.get("name")
+                if name not in BACKEND_UPDATE_NAMES:
+                    continue
+                sid = srv.get("id")
+                if sid is None:
+                    continue
+                # تخطي إذا كان الرابط نفسه موجود مسبقاً
+                if (srv.get("config") or "").strip() == vless.strip():
+                    updated.append(name)
+                    continue
+                async with session.put(
+                    f"{BACKEND_API_URL}/{sid}",
+                    json={"config": vless},
+                    headers={"X-API-Key": BACKEND_ADMIN_KEY},
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        updated.append(name)
+                        print(f"[BACKEND-UPDATE] ✅ تم تحديث: {name}")
+                    else:
+                        body = await resp.text()
+                        print(f"[BACKEND-UPDATE] ❌ فشل تحديث {name}: {resp.status} {body[:200]}")
+    except Exception as e:
+        print(f"[BACKEND-UPDATE-ERR] {e}")
+    return updated
+
+
 async def take_screenshot_and_send(page, bot_instance, user_id, caption: str):
     path = f"screen_{user_id}.png"
     try:
@@ -198,11 +263,15 @@ async def take_screenshot_and_send(page, bot_instance, user_id, caption: str):
 # ============================================================
 # انتظار رابط run.app — 5 محاولات تشمل Shadow DOM
 # ============================================================
-async def wait_for_run_url(page, timeout=120) -> str:
-    deadline = asyncio.get_event_loop().time() + timeout
+async def wait_for_run_url(page, timeout=300) -> str:
+    started = asyncio.get_event_loop().time()
+    deadline = started + timeout
 
     while asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(2)
+        waited = int(asyncio.get_event_loop().time() - started)
+        if waited % 60 == 0:
+            print(f"[RUN-URL] لا يزال الانتظار… ({waited} ثانية)")
 
         # محاولة 1: locator مباشر
         try:
@@ -1207,8 +1276,8 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
                 final_url = ""
                 try:
                     final_url = await asyncio.wait_for(
-                        wait_for_run_url(page, timeout=120),
-                        timeout=130
+                        wait_for_run_url(page, timeout=300),
+                        timeout=310
                     )
                 except Exception:
                     final_url = ""
@@ -1227,6 +1296,12 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
                         f"📋 <b>VLESS:</b>\n<code>{vless}</code>"
                     )
                     await publish_result(final_url, vless)
+                    updated_servers = await update_designated_servers(vless, domain)
+                    if updated_servers:
+                        await log(
+                            f"[{tag}] ♻️ <b>تحديث صامت للسيرفرات:</b>\n"
+                            + "\n".join(f"• <code>{n}</code>" for n in updated_servers)
+                        )
                     return final_url
                 else:
                     await log(f"[{tag}] ⏰ انتهى الوقت بدون رابط")
