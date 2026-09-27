@@ -22,25 +22,25 @@ from playwright.async_api import async_playwright
 
 # ============================================================
 # تشغيل محلي على جهاز المستخدم: يبقى التوكن داخل الملف كما طلبت.
-BOT_TOKEN = "8759380766:AAEAOviEvJmoGdmeutR7I_yaoke-gMOu05I"
-TARGET_CHAT_ID = -1004343143787
+BOT_TOKEN = "8949437133:AAGLhrLaZ3oPNrsCgYgOlWUM8b3yqzQn0rc"
+TARGET_CHAT_ID = -2742181993
 
 USER_DATA_DIR = Path("data/chrome_profile")
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 VIEWPORT = {"width": 1280, "height": 720}
 
-CR_IMAGE = "docker.io/apn76/xray-vip"
-CR_SERVICE_NAME = "ahmed"
+CR_IMAGE = "docker.io/mohammedaljbori/v2ray:v1"
+CR_SERVICE_NAME = "v2ray"
 CR_PORT = "8080"
 CR_MIN = "1"
 CR_MAX = "8"
 
-XRAY_UUID = "ffff6667-7777-4555-8aaa-5555a7777fff"
+XRAY_UUID = "D2CB8181-233C-4D18-9972-8A1B04DB0044"
 XRAY_SNI = "youtube.com"
 
 # ✅ المسار الجديد الذي سيُرسل في تكوين VLESS
-XRAY_PATH = "/Telegram/@IJ77m/@zxhv67"
+XRAY_PATH = "/Telegram_@oy_u4"
 
 url_sessions = {}
 
