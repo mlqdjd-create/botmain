@@ -1,6 +1,6 @@
 """
 بوت تيليجرام — Google Cloud → Cloud Run Service
-نظام طابور + أزرار اختيار الملف + إحصائيات للأدمن + ملفات .dark ديناميكية
+نظام طابور + أزرار اختيار الملف بعد النشر + إحصائيات للأدمن
 """
 
 import asyncio
@@ -29,7 +29,7 @@ from aiogram.client.default import DefaultBotProperties
 from playwright.async_api import async_playwright
 
 # ============================================================
-# الإعدادات الأساسية
+# الإعدادات
 # ============================================================
 BOT_TOKEN = "8949437133:AAGLhrLaZ3oPNrsCgYgOlWUM8b3yqzQn0rc"
 TARGET_CHAT_ID = -2742181993
@@ -38,7 +38,6 @@ ADMIN_ID = 6603530067
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN غير مضبوط.")
 
-# ✅ تعريف البوت والـ Dispatcher هنا قبل أي ديكوريتور
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -61,7 +60,7 @@ XRAY_SNI = "youtube.com"
 XRAY_PATH = "/Telegram_@oy_u4"
 
 # ============================================================
-# قوالب ملفات .dark — يُستبدل فيها الدومين ديناميكياً
+# قوالب .dark
 # ============================================================
 DARK_ZAIN_TEMPLATE = (
     "darktunnel://eyJ0eXBlIjoiVkxFU1MiLCJuYW1lIjoiR0NQLXVzLWNlbnRyYWwxIiwidmxlc3NUdW5uZWxDb25maWciOnsidjJyYXlDb25maWciOnsiaG9zdCI6"
@@ -78,10 +77,7 @@ DARK_YOUTUBE_TEMPLATE = (
     "In19fQ=="
 )
 
-# حالة المستخدمين
-user_choice: dict[int, str] = {}          # اختيار نوع الملف
-pending_urls: dict[int, dict] = {}        # الرابط قبل الاختيار
-url_sessions: dict[int, dict] = {}        # جلسات Playwright
+url_sessions: dict[int, dict] = {}
 
 STEALTH_JS = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -93,7 +89,7 @@ window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: 
 
 
 # ============================================================
-# أدوات ملفات .dark
+# ملفات .dark
 # ============================================================
 def _b64_replace_host(template: str, new_host: str) -> str:
     try:
@@ -105,8 +101,7 @@ def _b64_replace_host(template: str, new_host: str) -> str:
         raw = base64.b64decode(b64 + ("=" * pad)).decode("utf-8", errors="ignore")
         raw = re.sub(r'"host"\s*:\s*"[^"]*"', f'"host": "{new_host}"', raw)
         raw = re.sub(r'"wsHeaderHost"\s*:\s*"[^"]*"', f'"wsHeaderHost": "{new_host}"', raw)
-        new_b64 = base64.b64encode(raw.encode("utf-8")).decode("ascii")
-        return prefix + new_b64
+        return prefix + base64.b64encode(raw.encode("utf-8")).decode("ascii")
     except Exception as e:
         print(f"[DARK-B64-ERR] {e}")
         return template
@@ -151,14 +146,12 @@ async def goto_google_with_retry(page, url: str, label: str, attempts: int = 3):
             except Exception:
                 pass
             await asyncio.sleep(attempt * 3)
-    raise GoogleNavigationError(
-        f"تعذر فتح {label} بعد {attempts} محاولات: {last_error}"
-    ) from last_error
+    raise GoogleNavigationError(f"تعذر فتح {label}: {last_error}") from last_error
 
 
 def extract_project_id(url: str) -> str:
-    match = re.search(r'(qwiklabs-gcp-[\w\-]+)', url)
-    return match.group(1) if match else ""
+    m = re.search(r'(qwiklabs-gcp-[\w\-]+)', url)
+    return m.group(1) if m else ""
 
 
 async def read_page_text(page):
@@ -206,7 +199,7 @@ def build_vless(domain: str) -> str:
 
 
 # ============================================================
-# LiveStatus — رسالة واحدة تتحدث بدل عشرات الرسائل
+# LiveStatus
 # ============================================================
 class LiveStatus:
     def __init__(self, chat_id: int):
@@ -228,7 +221,7 @@ class LiveStatus:
 
 
 # ============================================================
-# الإشعارات والإرسال
+# إشعارات
 # ============================================================
 async def publish_result(final_url: str, vless: str):
     if not TARGET_CHAT_ID:
@@ -274,16 +267,17 @@ async def send_dark_file_to_user(user_id: int, kind: str, domain: str):
         content = build_dark_file(kind, domain)
         if kind == "zain":
             filename = "زين واسيا.dark"
-            caption = "📶 <b>ملف زين واسيا</b> — تم التحديث ✅"
+            caption = "📶 <b>ملف زين واسيا</b>"
         else:
             filename = "عرض يوتيوب.dark"
-            caption = "▶️ <b>ملف عرض يوتيوب</b> — تم التحديث ✅"
+            caption = "▶️ <b>ملف عرض يوتيوب</b>"
 
         await bot.send_document(
             chat_id=user_id,
             document=BufferedInputFile(content.encode("utf-8"), filename=filename),
             caption=caption,
         )
+        print(f"[DARK-FILE] ✅ {filename} → {user_id}")
     except Exception as e:
         print(f"[DARK-FILE-ERR] {e}")
 
@@ -301,7 +295,7 @@ async def take_screenshot_and_send(page, user_id, caption: str):
 
 
 # ============================================================
-# أدوات الصفحة
+# أدوات الصفحة (نفس المحرك — لا تغيير)
 # ============================================================
 async def wait_for_run_url(page, timeout=120) -> str:
     deadline = asyncio.get_event_loop().time() + timeout
@@ -678,9 +672,6 @@ async def find_input(page, selectors):
     return None, None
 
 
-# ============================================================
-# موافقات وAPI
-# ============================================================
 async def has_cloud_consent(page) -> bool:
     for frame in page.frames:
         try:
@@ -889,7 +880,7 @@ async def pick_project(page) -> str:
 
 
 # ============================================================
-# Workflow الرئيسي (مبسّط برسالة واحدة)
+# Workflow (نفس المحرك)
 # ============================================================
 async def full_workflow(page, user_id, username, sso_url="", job_id=0):
     tag = f"@{username}"
@@ -906,7 +897,7 @@ async def full_workflow(page, user_id, username, sso_url="", job_id=0):
             stage_stuck_since[stage] = now
             return False
         if now - stage_stuck_since[stage] >= STUCK_LIMIT:
-            await log(f"⚠️ {tag} — تجمد في <code>{stage}</code>\nسيتم التخطي.")
+            await log(f"⚠️ {tag} — تجمد في <code>{stage}</code>")
             await take_screenshot_and_send(page, user_id, f"تجمد: {stage}")
             return True
         return False
@@ -1158,14 +1149,40 @@ async def full_workflow(page, user_id, username, sso_url="", job_id=0):
                     domain = final_url.replace("https://", "").replace("http://", "").rstrip("/")
                     vless = build_vless(domain)
 
-                    await log(f"🎉 {tag} — تم النشر ✅\nجاري إرسال الملف…")
+                    # ✅ تم النشر — الرسالة النهائية مع الأزرار
+                    await log(
+                        f"🎉 <b>تم النشر بنجاح!</b>\n\n"
+                        f"🔗 <b>الرابط:</b>\n<code>{final_url}</code>\n\n"
+                        f"📋 <b>VLESS:</b>\n<code>{vless}</code>\n\n"
+                        f"👇 <b>اختر نوع الملف الذي تريده:</b>"
+                    )
+
+                    # ✅ الأزرار تظهر الآن فقط — بعد النشر
+                    try:
+                        await bot.send_message(
+                            user_id,
+                            "📁 <b>اختر الملف:</b>",
+                            reply_markup=get_result_kind_keyboard(job_id),
+                        )
+                    except Exception as e:
+                        print(f"[SEND-KIND-BTN-ERR] {e}")
+
+                    # نشر في القناة
                     await publish_result(final_url, vless)
 
-                    kind = user_choice.get(user_id, "")
-                    await notify_admin(user_id, username, final_url, vless, job_id, kind)
+                    # إشعار الأدمن الأول — الرابط أنشئ
+                    await notify_admin(
+                        user_id, username, final_url, vless, job_id, ""
+                    )
 
-                    if kind:
-                        await send_dark_file_to_user(user_id, kind, domain)
+                    # نحفظ النتيجة ليستخدمها زر الاختيار
+                    job_results[job_id] = {
+                        "user_id": user_id,
+                        "username": username,
+                        "final_url": final_url,
+                        "vless": vless,
+                        "domain": domain,
+                    }
 
                     return final_url
                 else:
@@ -1206,7 +1223,7 @@ async def full_workflow_safe(page, user_id, username, sso_url="", job_id=0):
 
 
 # ============================================================
-# جلسة Playwright
+# جلسة Playwright (نفس المحرك)
 # ============================================================
 async def start_url_session(user_id, url):
     user_dir = USER_DATA_DIR / f"user_{user_id}"
@@ -1319,7 +1336,7 @@ async def submit_value(page, value, stage):
 
 
 # ============================================================
-# إدارة الطابور
+# الطابور
 # ============================================================
 @dataclass
 class QueueItem:
@@ -1336,6 +1353,9 @@ job_ids = count(1)
 jobs_by_id: dict[int, QueueItem] = {}
 queued_job_ids: deque = deque()
 active_job_id = None
+
+# ✅ نتائج المهام الجاهزة — job_id → بيانات الرابط
+job_results: dict[int, dict] = {}
 
 
 def pending_jobs_for_user(user_id: int):
@@ -1422,63 +1442,70 @@ async def queue_worker():
 
 
 # ============================================================
-# الأزرار
+# الأزرار — تظهر بعد اكتمال النشر فقط
 # ============================================================
-def get_kind_keyboard(user_id: int) -> InlineKeyboardMarkup:
+def get_result_kind_keyboard(job_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="📶 زين واسيا", callback_data=f"kind:zain:{user_id}"),
-            InlineKeyboardButton(text="▶️ عرض يوتيوب", callback_data=f"kind:youtube:{user_id}"),
+            InlineKeyboardButton(
+                text="📶 زين واسيا",
+                callback_data=f"result:zain:{job_id}",
+            ),
+            InlineKeyboardButton(
+                text="▶️ عرض يوتيوب",
+                callback_data=f"result:youtube:{job_id}",
+            ),
         ]]
     )
 
 
-@dp.callback_query(F.data.startswith("kind:"))
-async def on_kind_choice(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("result:"))
+async def on_result_choice(callback: CallbackQuery):
     try:
-        _, kind, owner_id_str = callback.data.split(":", 2)
-        owner_id = int(owner_id_str)
+        _, kind, job_id_str = callback.data.split(":", 2)
+        job_id = int(job_id_str)
     except Exception:
         await callback.answer("❌ بيانات غير صالحة", show_alert=True)
         return
 
-    if callback.from_user.id != owner_id:
+    result = job_results.get(job_id)
+    if not result:
+        await callback.answer("❌ انتهت صلاحية هذا الرابط", show_alert=True)
+        return
+
+    if callback.from_user.id != result["user_id"]:
         await callback.answer("⚠️ هذه الأزرار ليست لك.", show_alert=True)
         return
 
-    user_choice[owner_id] = kind
     label = "زين واسيا 📶" if kind == "zain" else "عرض يوتيوب ▶️"
 
+    # حذف رسالة الأزرار
     try:
         await callback.message.delete()
     except Exception:
         pass
 
-    pending = pending_urls.pop(owner_id, None)
-    if not pending:
-        await callback.answer("❌ الرابط منتهي، أرسله مجدداً", show_alert=True)
-        return
-
     await callback.answer(f"✅ {label}")
 
-    item = QueueItem(
-        job_id=next(job_ids),
-        user_id=owner_id,
-        url=pending["url"],
-        username=pending["username"],
+    # ✅ إرسال الملف الصحيح حسب الاختيار
+    await send_dark_file_to_user(
+        user_id=result["user_id"],
+        kind=kind,
+        domain=result["domain"],
     )
-    jobs_by_id[item.job_id] = item
-    queued_job_ids.append(item.job_id)
-    pos = queue_position(item.job_id)
-    await task_queue.put(item)
 
-    try:
-        if pos and pos > 1:
-            await bot.send_message(owner_id, f"📥 مكانك في الطابور: <b>{pos}</b>")
-        else:
-            await bot.send_message(owner_id, "📥 سيبدأ الآن…")
-    except Exception:
-        pass
+    # ✅ إشعار الأدمن بالاختيار النهائي
+    await notify_admin(
+        user_id=result["user_id"],
+        username=result["username"],
+        final_url=result["final_url"],
+        vless=result["vless"],
+        job_id=job_id,
+        file_kind=kind,
+    )
+
+    # تنظيف
+    job_results.pop(job_id, None)
 
 
 # ============================================================
@@ -1490,7 +1517,8 @@ async def cmd_start(message: Message):
         "👋 <b>Google Cloud → Cloud Run</b>\n\n"
         "📎 أرسل رابط Google SSO من:\n"
         "https://www.skills.google/focuses/33353?parent=catalog\n\n"
-        "ثم اختر نوع الملف من الأزرار.\n\n"
+        "⏳ سيبدأ العمل مباشرة.\n"
+        "📁 بعد اكتمال النشر ستظهر لك أزرار اختيار الملف.\n\n"
         "/cancel — إلغاء\n/status — حالة"
     )
 
@@ -1526,6 +1554,9 @@ async def cmd_cancel(message: Message):
         await message.answer("لا يوجد ما يمكن إلغاؤه.")
 
 
+# ============================================================
+# إرسال الرابط — يبدأ مباشرة
+# ============================================================
 @dp.message(F.text.startswith("http"))
 async def handle_url(message: Message):
     uid = message.from_user.id
@@ -1540,11 +1571,27 @@ async def handle_url(message: Message):
             pass
         return
 
-    pending_urls[uid] = {"url": url, "username": username}
-    await message.answer(
-        "📁 <b>اختر نوع الملف:</b>",
-        reply_markup=get_kind_keyboard(uid),
+    item = QueueItem(
+        job_id=next(job_ids),
+        user_id=uid,
+        url=url,
+        username=username,
     )
+    jobs_by_id[item.job_id] = item
+    queued_job_ids.append(item.job_id)
+    pos = queue_position(item.job_id)
+    await task_queue.put(item)
+
+    if pos and pos > 1:
+        await message.answer(
+            f"📥 تم استلام الرابط رقم <b>{item.job_id}</b>\n"
+            f"مكانك في الطابور: <b>{pos}</b>"
+        )
+    else:
+        await message.answer(
+            f"📥 تم استلام الرابط رقم <b>{item.job_id}</b>\n"
+            "⏳ سيبدأ العمل الآن…"
+        )
 
 
 @dp.message(F.text & ~F.text.startswith("/") & ~F.text.startswith("http"))
