@@ -1,10 +1,11 @@
 """
 بوت تيليجرام — Google Cloud → Cloud Run Service
-نظام طابور + أزرار اختيار الملف بعد النشر + إحصائيات للأدمن
+نظام طابور + أزرار بعد النشر + ملفات .dark باستبدال JSON موثوق
 """
 
 import asyncio
 import base64
+import json
 import os
 import re
 import shutil
@@ -62,10 +63,12 @@ XRAY_PATH = "/Telegram_@oy_u4"
 # ============================================================
 # قوالب .dark
 # ============================================================
+# ✅ زين واسيا — القالب الجديد (wsHeaderHost سيُستبدل، host يبقى على blogspot)
 DARK_ZAIN_TEMPLATE = (
     "darktunnel://eyJ0eXBlIjoiVkxFU1MiLCJuYW1lIjoi2YXZhNmBINiy2YrZhiDZiNin2LPZitinINmF2YHYqtmI2K0g2KfZhNiq2LTZgdmK2LEg2K_Yp9ix2YMiLCJ2bGVzc1R1bm5lbENvbmZpZyI6eyJ2MnJheUNvbmZpZyI6eyJob3N0Ijoia2VzaGFrYW55ZmFjZWJvb2suYmxvZ3Nwb3QuY29tIiwicG9ydCI6NDQzLCJ1dWlkIjoiRDJDQjgxODEtMjMzQy00RDE4LTk5NzItOEExQjA0REIwMDQ0Iiwic2VydmVyTmFtZUluZGljYXRpb24iOiJrZXNoYWthbnlmYWNlYm9vay5ibG9nc3BvdC5jb20iLCJ3c1BhdGgiOiIvVGVsZWdyYW1fQG95X3U0Iiwid3NIZWFkZXJIb3N0IjoidjJyYXktNzM3NTM0NDkyMDA4LnVzLWNlbnRyYWwxLnJ1bi5hcHAifSwiaW5qZWN0Q29uZmlnIjp7ImVuYWJsZWQiOnRydWUsIm1vZGUiOiJQUk9YWSIsInNlcnZlck5hbWVJbmRpY2F0aW9uIjoia2VzaGFrYW55ZmFjZWJvb2suYmxvZ3Nwb3QuY29tIiwicHJveHlIb3N0IjoiMzEuMTMuODMuMzkiLCJwYXlsb2FkIjoiQ09OTkVDVCBbaG9zdF06W3BvcnRdIEhUVFAvMS4xW2NybGZdeC1jb25uZWN0ZWQtdG86IDM0LjE0My43Mi4yW2NybGZdcHJveHktY29ubmVjdGlvbjoga2VlcC1hbGl2ZVtjcmxmXWNvbm5lY3Rpb246IGtlZXAtYWxpdmVbY3JsZl11c2VyLWFnZW50OiBGQkFWLzAuMCBbY3JsZl14LWlvcmctYnNpZDogQG95X3U0altjcmxmXVtjcmxmXSJ9fX0="
 )
 
+# ✅ عرض يوتيوب — host و wsHeaderHost سيُستبدلان معاً
 DARK_YOUTUBE_TEMPLATE = (
     "darktunnel://eyJ0eXBlIjoiVkxFU1MiLCJuYW1lIjoiR0NQLVhyYXkiLCJ2bGVzc1R1bm5lbENvbmZpZyI6eyJ2MnJheUNvbmZpZyI6eyJob3N0Ijoi"
     "v2ray-779998501920.us-central1.run.app"
@@ -86,27 +89,66 @@ window.chrome = { runtime: {}, loadTimes: function(){}, csi: function(){}, app: 
 
 
 # ============================================================
-# ملفات .dark
+# ملفات .dark — استبدال JSON موثوق
 # ============================================================
-def _b64_replace_host(template: str, new_host: str) -> str:
+def _decode_dark_payload(template: str) -> str:
+    """يفك base64 من قالب darktunnel://"""
+    prefix = "darktunnel://"
+    b64 = template[len(prefix):]
+    pad = (-len(b64)) % 4
+    return base64.b64decode(b64 + ("=" * pad)).decode("utf-8", errors="ignore")
+
+
+def _encode_dark_payload(raw: str) -> str:
+    """يُعيد ترميز JSON إلى darktunnel://"""
+    return "darktunnel://" + base64.b64encode(raw.encode("utf-8")).decode("ascii")
+
+
+def _replace_hosts_strict(raw: str, new_host: str, only_ws_header: bool = False) -> str:
+    """
+    يعيد بناء JSON بشكل صريح:
+    - wsHeaderHost → يُستبدل دائماً
+    - host → يُستبدل فقط إذا only_ws_header=False
+    """
     try:
-        prefix = "darktunnel://"
-        if not template.startswith(prefix):
-            return template
-        b64 = template[len(prefix):]
-        pad = (-len(b64)) % 4
-        raw = base64.b64decode(b64 + ("=" * pad)).decode("utf-8", errors="ignore")
-        raw = re.sub(r'"host"\s*:\s*"[^"]*"', f'"host": "{new_host}"', raw)
-        raw = re.sub(r'"wsHeaderHost"\s*:\s*"[^"]*"', f'"wsHeaderHost": "{new_host}"', raw)
-        return prefix + base64.b64encode(raw.encode("utf-8")).decode("ascii")
+        data = json.loads(raw)
     except Exception as e:
-        print(f"[DARK-B64-ERR] {e}")
-        return template
+        print(f"[DARK-JSON-ERR] {e}")
+        return raw
+
+    def walk(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "wsHeaderHost" and isinstance(v, str):
+                    obj[k] = new_host
+                elif k == "host" and isinstance(v, str) and not only_ws_header:
+                    obj[k] = new_host
+                elif isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(data)
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 def build_dark_file(kind: str, domain: str) -> str:
-    tpl = DARK_ZAIN_TEMPLATE if kind == "zain" else DARK_YOUTUBE_TEMPLATE
-    return _b64_replace_host(tpl, domain)
+    if kind == "zain":
+        tpl = DARK_ZAIN_TEMPLATE
+        only_header = True   # wsHeaderHost فقط
+    else:
+        tpl = DARK_YOUTUBE_TEMPLATE
+        only_header = False  # host + wsHeaderHost
+
+    raw = _decode_dark_payload(tpl)
+    new_raw = _replace_hosts_strict(raw, domain, only_ws_header=only_header)
+
+    # ✅ للتشخيص — تظهر في Cloud Run logs
+    print(f"[DARK-BUILD] kind={kind} domain={domain}")
+    print(f"[DARK-BUILD] result={new_raw[:250]}")
+
+    return _encode_dark_payload(new_raw)
 
 
 # ============================================================
@@ -1146,7 +1188,6 @@ async def full_workflow(page, user_id, username, sso_url="", job_id=0):
                     domain = final_url.replace("https://", "").replace("http://", "").rstrip("/")
                     vless = build_vless(domain)
 
-                    # ✅ تم النشر — الرسالة النهائية مع الأزرار
                     await log(
                         f"🎉 <b>تم النشر بنجاح!</b>\n\n"
                         f"🔗 <b>الرابط:</b>\n<code>{final_url}</code>\n\n"
@@ -1154,7 +1195,6 @@ async def full_workflow(page, user_id, username, sso_url="", job_id=0):
                         f"👇 <b>اختر نوع الملف الذي تريده:</b>"
                     )
 
-                    # ✅ الأزرار تظهر الآن فقط — بعد النشر
                     try:
                         await bot.send_message(
                             user_id,
@@ -1164,15 +1204,12 @@ async def full_workflow(page, user_id, username, sso_url="", job_id=0):
                     except Exception as e:
                         print(f"[SEND-KIND-BTN-ERR] {e}")
 
-                    # نشر في القناة
                     await publish_result(final_url, vless)
 
-                    # إشعار الأدمن الأول — الرابط أنشئ
                     await notify_admin(
                         user_id, username, final_url, vless, job_id, ""
                     )
 
-                    # نحفظ النتيجة ليستخدمها زر الاختيار
                     job_results[job_id] = {
                         "user_id": user_id,
                         "username": username,
@@ -1351,7 +1388,6 @@ jobs_by_id: dict[int, QueueItem] = {}
 queued_job_ids: deque = deque()
 active_job_id = None
 
-# ✅ نتائج المهام الجاهزة — job_id → بيانات الرابط
 job_results: dict[int, dict] = {}
 
 
@@ -1439,7 +1475,7 @@ async def queue_worker():
 
 
 # ============================================================
-# الأزرار — تظهر بعد اكتمال النشر فقط
+# الأزرار — بعد اكتمال النشر فقط
 # ============================================================
 def get_result_kind_keyboard(job_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -1476,7 +1512,6 @@ async def on_result_choice(callback: CallbackQuery):
 
     label = "زين واسيا 📶" if kind == "zain" else "عرض يوتيوب ▶️"
 
-    # حذف رسالة الأزرار
     try:
         await callback.message.delete()
     except Exception:
@@ -1484,14 +1519,12 @@ async def on_result_choice(callback: CallbackQuery):
 
     await callback.answer(f"✅ {label}")
 
-    # ✅ إرسال الملف الصحيح حسب الاختيار
     await send_dark_file_to_user(
         user_id=result["user_id"],
         kind=kind,
         domain=result["domain"],
     )
 
-    # ✅ إشعار الأدمن بالاختيار النهائي
     await notify_admin(
         user_id=result["user_id"],
         username=result["username"],
@@ -1501,7 +1534,6 @@ async def on_result_choice(callback: CallbackQuery):
         file_kind=kind,
     )
 
-    # تنظيف
     job_results.pop(job_id, None)
 
 
