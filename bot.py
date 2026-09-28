@@ -47,16 +47,14 @@ XRAY_PATH = "/Telegram_@oy_u4"
 
 # ============================================================
 # ✅ ربط البوت بباك إند التطبيق (AHMED VPN):
-# كل رابط صحيح ينشئه أي شخص عبر البوت يُرفع تلقائياً للباك إند،
-# وتطبيقات المستخدمين تسحبه بالمزامنة الخلفية الصامتة
-# (بدون زر تحديث وبدون أي إشعار يظهر لهم).
+# كل رابط جديد يُستخدم لتحديث السيرفرات المعلمة "تجديد تلقائي" من
+# البوت الأساسي — يستبدل الدومين القديم (run.app) بالجديد في كل حقل
+# يحتويه (يشمل صيغة darktunnel:// المشفرة) بدون إضافة أي سيرفر جديد
+# وبدون ما يشعر مستخدم التطبيق.
 # ============================================================
 BACKEND_API_URL = "https://ahmedvpnh-production.up.railway.app/api/servers"
 # ⚠️ غيّر هذه القيمة إذا كانت ADMIN_API_KEY على Railway مختلفة
 BACKEND_ADMIN_KEY = "ahmed_vpn_admin_secret_key_2026"
-
-# ✅ السيرفرات التي تتجدد تلقائياً تُعلَّم من البوت الأساسي (زر
-# "♻️ تجديد تلقائي للسيرفرات") — البوت هذا يحدّث هوستها فقط بصمت
 
 url_sessions = {}
 
@@ -271,8 +269,8 @@ def replace_run_domain_in_text(text: str, new_domain: str) -> str:
 
 async def update_auto_servers(new_domain: str) -> list:
     """يحدّث فقط السيرفرات المعلمة "تجديد تلقائي" من البوت الأساسي:
-    يستبدل الهوست داخل رابطها بالدومين الجديد — بدون إضافة أي سيرفر
-    جديد، وبدون ما يشعر مستخدم التطبيق (تحديث صامت كامل).
+    يستبدل الدومين القديم بالجديد في كل حقل يحتويه — بدون إضافة أي
+    سيرفر جديد، وبدون ما يشعر مستخدم التطبيق (تحديث صامت كامل).
 
     ترجع قائمة بأسماء السيرفرات التي تم تحديثها فعلاً."""
     updated = []
@@ -359,7 +357,7 @@ async def take_screenshot_and_send(page, bot_instance, user_id, caption: str):
 # ============================================================
 # انتظار رابط run.app — 5 محاولات تشمل Shadow DOM
 # ============================================================
-async def wait_for_run_url(page, timeout=300) -> str:
+async def wait_for_run_url(page, timeout=360) -> str:
     started = asyncio.get_event_loop().time()
     deadline = started + timeout
 
@@ -1372,11 +1370,33 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
                 final_url = ""
                 try:
                     final_url = await asyncio.wait_for(
-                        wait_for_run_url(page, timeout=300),
-                        timeout=310
+                        wait_for_run_url(page, timeout=360),
+                        timeout=370
                     )
                 except Exception:
                     final_url = ""
+
+                # خطة بديلة: الخدمة أحياناً تُنشر فعلاً لكن صفحة الإنشاء
+                # لا تعرض الرابط — نفتح قائمة خدمات Cloud Run وندور
+                # عليه هناك (رابط الخدمة يظهر بالقائمة دائماً)
+                if not final_url:
+                    try:
+                        await log(f"[{tag}] 🔄 محاولة بديلة: فتح قائمة خدمات Cloud Run…")
+                        await page.goto(
+                            "https://console.cloud.google.com/run/services",
+                            wait_until="commit",
+                            timeout=60_000,
+                        )
+                        try:
+                            await page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                        except Exception:
+                            pass
+                        final_url = await asyncio.wait_for(
+                            wait_for_run_url(page, timeout=180),
+                            timeout=190
+                        )
+                    except Exception:
+                        final_url = ""
 
                 if final_url:
                     domain = (
