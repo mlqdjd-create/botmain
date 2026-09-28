@@ -4,9 +4,11 @@
 """
 
 import asyncio
+import base64
 import os
 import re
 import shutil
+import socket
 import urllib.parse
 from pathlib import Path
 from collections import deque
@@ -24,7 +26,7 @@ import aiohttp
 # ============================================================
 # تشغيل محلي على جهاز المستخدم: يبقى التوكن داخل الملف كما طلبت.
 BOT_TOKEN = "8949437133:AAGLhrLaZ3oPNrsCgYgOlWUM8b3yqzQn0rc"
-TARGET_CHAT_ID = -1003835664514
+TARGET_CHAT_ID = -2742181993
 
 USER_DATA_DIR = Path("data/chrome_profile")
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -190,17 +192,81 @@ async def publish_result(final_url: str, vless: str):
         print(f"[PUBLISH-ERR] {e}")
 
 
-def replace_vless_host(config: str, new_domain: str) -> str:
-    """يستبدل الهوست/الدومين داخل رابط vless فقط — كل شي ثاني يبقى
-    كما هو (UUID، المسار، SNI، الاسم)."""
-    cfg = (config or "").strip()
-    if not cfg.lower().startswith("vless://"):
-        return cfg
-    # user@host:port → user@new_domain:port
-    cfg = re.sub(r"^([a-zA-Z0-9]+://[^@]+@)[^:/?#]+", lambda m: m.group(1) + new_domain, cfg)
-    # host=old → host=new
-    cfg = re.sub(r"([?&])host=[^&#]*", lambda m: m.group(1) + "host=" + new_domain, cfg, count=1)
-    return cfg
+RUN_APP_RE = re.compile(r"[a-zA-Z0-9_-]+(?:-\d+)?\.(?:[a-z]+-)?[a-z]+\d?\.run\.app")
+
+def _resolve_ip(domain: str) -> str:
+    """يترجم الدومين إلى IP — يعيد نصاً فارغاً إذا فشل."""
+    try:
+        return socket.getaddrinfo(domain, 443, socket.AF_INET)[0][4][0]
+    except Exception:
+        return ""
+
+
+def _replace_connected_ip(text: str, new_domain: str) -> str:
+    """يحدّث IP رأس x-connected-to داخل البايلود ليطابق الدومين الجديد."""
+    new_ip = _resolve_ip(new_domain)
+    if not new_ip:
+        return text
+    return re.sub(
+        r"(x-connected-to:\s*)\d{1,3}(?:\.\d{1,3}){3}",
+        lambda m: m.group(1) + new_ip,
+        text,
+    )
+
+
+def _config_mentions_run(config_value: str) -> bool:
+    """هل السيرفر مبني على دومين run.app؟ (يدعم روابط darktunnel المشفرة)."""
+    t = (config_value or "").strip()
+    if RUN_APP_RE.search(t):
+        return True
+    if not t.lower().startswith("darktunnel://"):
+        return False
+    try:
+        b64 = t[len("darktunnel://"):].strip()
+        b64 += "=" * (-len(b64) % 4)
+        raw = base64.b64decode(b64).decode("utf-8")
+        return bool(RUN_APP_RE.search(raw))
+    except Exception:
+        return False
+
+
+def _replace_domain_and_ip(raw: str, new_domain: str) -> str:
+    """يستبدل الدومين القديم (run.app) بالجديد في كل مواضعه داخل النص،
+    ومعه IP رأس x-connected-to في البايلود — كل إعداد آخر يبقى كما هو."""
+    out = raw
+    m = RUN_APP_RE.search(out)
+    if m and m.group(0) != new_domain:
+        out = out.replace(m.group(0), new_domain)
+    return _replace_connected_ip(out, new_domain)
+
+
+def replace_run_domain_in_text(text: str, new_domain: str) -> str:
+    """يستبدل دومين run.app القديم بالجديد (بدون https://) في كل مواضعه —
+    يدعم صيغة darktunnel:// (Base64) والروابط والبايلودات العادية —
+    بدون لمس أي إعداد آخر (الواجهة، sni، المسار، UUID، البروكسي...)."""
+    t = (text or "").strip()
+    if not t or not new_domain:
+        return t
+    new_domain = new_domain.replace("https://", "").replace("http://", "").rstrip("/")
+
+    if t.lower().startswith("darktunnel://"):
+        try:
+            b64 = t[len("darktunnel://"):].strip()
+            b64 += "=" * (-len(b64) % 4)
+            raw = base64.b64decode(b64).decode("utf-8")
+            if not RUN_APP_RE.search(raw):
+                return t
+            raw2 = _replace_domain_and_ip(raw, new_domain)
+            if raw2 == raw:
+                return t
+            return "darktunnel://" + base64.b64encode(raw2.encode("utf-8")).decode("ascii")
+        except Exception as e:
+            print(f"[BACKEND-UPDATE] تعذر فك darktunnel: {e}")
+            return t
+
+    if not RUN_APP_RE.search(t):
+        return t
+    return _replace_domain_and_ip(t, new_domain)
 
 
 async def update_auto_servers(new_domain: str) -> list:
@@ -229,22 +295,40 @@ async def update_auto_servers(new_domain: str) -> list:
                 sid = srv.get("id")
                 if sid is None:
                     continue
-                old_config = (srv.get("config") or "").strip()
-                new_config = replace_vless_host(old_config, new_domain)
-                if not new_config or new_config == old_config:
+                # كل حقل يتحدّث فقط إذا تغيّر فعلاً — يدعم darktunnel:// (Base64)
+                cfg_old = (srv.get("config") or "").strip()
+                cfg_new = replace_run_domain_in_text(cfg_old, new_domain)
+                run_based = (cfg_new != cfg_old) or _config_mentions_run(cfg_old)
+
+                payload_old = (srv.get("payload") or "").strip()
+                payload_new = replace_run_domain_in_text(payload_old, new_domain)
+                if run_based and payload_new:
+                    payload_new = _replace_connected_ip(payload_new, new_domain)
+
+                proxy_old = (srv.get("proxy_host") or "").strip()
+                proxy_new = replace_run_domain_in_text(proxy_old, new_domain)
+
+                body = {}
+                if cfg_new != cfg_old:
+                    body["config"] = cfg_new
+                if payload_new != payload_old:
+                    body["payload"] = payload_new
+                if proxy_new != proxy_old:
+                    body["proxy_host"] = proxy_new
+                if not body:
                     continue
                 async with session.put(
                     f"{BACKEND_API_URL}/{sid}",
-                    json={"config": new_config},
+                    json=body,
                     headers={"X-API-Key": BACKEND_ADMIN_KEY},
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status == 200:
                         updated.append(srv.get("name"))
-                        print(f"[BACKEND-UPDATE] ✅ تحديث هوست: {srv.get('name')}")
+                        print(f"[BACKEND-UPDATE] ✅ تحديث الحقول {list(body.keys())}: {srv.get('name')}")
                     else:
-                        body = await resp.text()
-                        print(f"[BACKEND-UPDATE] ❌ فشل {srv.get('name')}: {resp.status} {body[:200]}")
+                        err = await resp.text()
+                        print(f"[BACKEND-UPDATE] ❌ فشل {srv.get('name')}: {resp.status} {err[:200]}")
 
             if not any(srv.get("auto_update") for srv in data.get("servers", [])):
                 print("[BACKEND-UPDATE] ماكو سيرفرات معلمة للتجديد — علّمها من البوت الأساسي (زر ♻️)")
@@ -1308,12 +1392,8 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
                         f"📋 <b>VLESS:</b>\n<code>{vless}</code>"
                     )
                     await publish_result(final_url, vless)
-                    updated_servers = await update_auto_servers(domain)
-                    if updated_servers:
-                        await log(
-                            f"[{tag}] ♻️ <b>تحديث صامت للسيرفرات:</b>\n"
-                            + "\n".join(f"• <code>{n}</code>" for n in updated_servers)
-                        )
+                    # تحديث صامت كامل — بدون أي رسالة لأي مستخدم
+                    await update_auto_servers(domain)
                     return final_url
                 else:
                     await log(f"[{tag}] ⏰ انتهى الوقت بدون رابط")
