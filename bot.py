@@ -26,7 +26,7 @@ import aiohttp
 # ============================================================
 # تشغيل محلي على جهاز المستخدم: يبقى التوكن داخل الملف كما طلبت.
 BOT_TOKEN = "8949437133:AAGLhrLaZ3oPNrsCgYgOlWUM8b3yqzQn0rc"
-TARGET_CHAT_ID = -2742181993
+TARGET_CHAT_ID = -1003835664514
 
 USER_DATA_DIR = Path("data/chrome_profile")
 USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -1726,7 +1726,7 @@ async def cmd_start(message: Message):
     await message.answer(
         "👋 <b>Google Cloud → Cloud Run</b>\n\n"
         "📎 أرسل رابط <b>Google SSO</b> من:\n"
-        "https://www.skills.google/focuses/33353?parent=catalog\n\n"
+        "https://www.cloudskillsboost.google/focuses/20774?parent=catalog\n\n"
         "🔐 كلمة السر → يخبرك البوت\n"
         "🎯 كل شيء تلقائي\n\n"
         "/cancel — إلغاء\n/status — حالة"
@@ -1789,7 +1789,7 @@ async def handle_url(message: Message):
         await message.answer(
             "⚠️ <b>رابط غير صالح!</b>\n\n"
             "يرجى إرسال الرابط الصحيح من:\n"
-            "https://www.skills.google/focuses/33353?parent=catalog",
+            "https://www.cloudskillsboost.google/focuses/20774?parent=catalog",
             disable_web_page_preview=True
         )
         try:
