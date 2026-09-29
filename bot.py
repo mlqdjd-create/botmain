@@ -52,7 +52,7 @@ XRAY_PATH = "/Telegram_@oy_u4"
 # يحتويه (يشمل صيغة darktunnel:// المشفرة) بدون إضافة أي سيرفر جديد
 # وبدون ما يشعر مستخدم التطبيق.
 # ============================================================
-BACKEND_API_URL = "https://ahmedvpnh-production.up.railway.app/api/servers"
+BACKEND = "https://MOHAMMEDALJBORIVIPNEW20279-production.up.railway.app"
 # ⚠️ غيّر هذه القيمة إذا كانت ADMIN_API_KEY على Railway مختلفة
 BACKEND_ADMIN_KEY = "ahmed_vpn_admin_secret_key_2026"
 
