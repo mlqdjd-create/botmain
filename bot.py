@@ -4,11 +4,9 @@
 """
 
 import asyncio
-import base64
 import os
 import re
 import shutil
-import socket
 import urllib.parse
 from pathlib import Path
 from collections import deque
@@ -21,7 +19,6 @@ from aiogram.types import Message, FSInputFile
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from playwright.async_api import async_playwright
-import aiohttp
 
 # ============================================================
 # تشغيل محلي على جهاز المستخدم: يبقى التوكن داخل الملف كما طلبت.
@@ -44,17 +41,6 @@ XRAY_SNI = "youtube.com"
 
 # ✅ المسار الجديد الذي سيُرسل في تكوين VLESS
 XRAY_PATH = "/Telegram_@oy_u4"
-
-# ============================================================
-# ✅ ربط البوت بباك إند التطبيق (AHMED VPN):
-# كل رابط جديد يُستخدم لتحديث السيرفرات المعلمة "تجديد تلقائي" من
-# البوت الأساسي — يستبدل الدومين القديم (run.app) بالجديد في كل حقل
-# يحتويه (يشمل صيغة darktunnel:// المشفرة) بدون إضافة أي سيرفر جديد
-# وبدون ما يشعر مستخدم التطبيق.
-# ============================================================
-BACKEND = "https://MOHAMMEDALJBORIVIPNEW20279-production.up.railway.app"
-# ⚠️ غيّر هذه القيمة إذا كانت ADMIN_API_KEY على Railway مختلفة
-BACKEND_ADMIN_KEY = "ahmed_vpn_admin_secret_key_2026"
 
 url_sessions = {}
 
@@ -190,151 +176,6 @@ async def publish_result(final_url: str, vless: str):
         print(f"[PUBLISH-ERR] {e}")
 
 
-RUN_APP_RE = re.compile(r"[a-zA-Z0-9_-]+(?:-\d+)?\.(?:[a-z]+-)?[a-z]+\d?\.run\.app")
-
-def _resolve_ip(domain: str) -> str:
-    """يترجم الدومين إلى IP — يعيد نصاً فارغاً إذا فشل."""
-    try:
-        return socket.getaddrinfo(domain, 443, socket.AF_INET)[0][4][0]
-    except Exception:
-        return ""
-
-
-def _replace_connected_ip(text: str, new_domain: str) -> str:
-    """يحدّث IP رأس x-connected-to داخل البايلود ليطابق الدومين الجديد."""
-    new_ip = _resolve_ip(new_domain)
-    if not new_ip:
-        return text
-    return re.sub(
-        r"(x-connected-to:\s*)\d{1,3}(?:\.\d{1,3}){3}",
-        lambda m: m.group(1) + new_ip,
-        text,
-    )
-
-
-def _config_mentions_run(config_value: str) -> bool:
-    """هل السيرفر مبني على دومين run.app؟ (يدعم روابط darktunnel المشفرة)."""
-    t = (config_value or "").strip()
-    if RUN_APP_RE.search(t):
-        return True
-    if not t.lower().startswith("darktunnel://"):
-        return False
-    try:
-        b64 = t[len("darktunnel://"):].strip()
-        b64 += "=" * (-len(b64) % 4)
-        raw = base64.b64decode(b64).decode("utf-8")
-        return bool(RUN_APP_RE.search(raw))
-    except Exception:
-        return False
-
-
-def _replace_domain_and_ip(raw: str, new_domain: str) -> str:
-    """يستبدل الدومين القديم (run.app) بالجديد في كل مواضعه داخل النص،
-    ومعه IP رأس x-connected-to في البايلود — كل إعداد آخر يبقى كما هو."""
-    out = raw
-    m = RUN_APP_RE.search(out)
-    if m and m.group(0) != new_domain:
-        out = out.replace(m.group(0), new_domain)
-    return _replace_connected_ip(out, new_domain)
-
-
-def replace_run_domain_in_text(text: str, new_domain: str) -> str:
-    """يستبدل دومين run.app القديم بالجديد (بدون https://) في كل مواضعه —
-    يدعم صيغة darktunnel:// (Base64) والروابط والبايلودات العادية —
-    بدون لمس أي إعداد آخر (الواجهة، sni، المسار، UUID، البروكسي...)."""
-    t = (text or "").strip()
-    if not t or not new_domain:
-        return t
-    new_domain = new_domain.replace("https://", "").replace("http://", "").rstrip("/")
-
-    if t.lower().startswith("darktunnel://"):
-        try:
-            b64 = t[len("darktunnel://"):].strip()
-            b64 += "=" * (-len(b64) % 4)
-            raw = base64.b64decode(b64).decode("utf-8")
-            if not RUN_APP_RE.search(raw):
-                return t
-            raw2 = _replace_domain_and_ip(raw, new_domain)
-            if raw2 == raw:
-                return t
-            return "darktunnel://" + base64.b64encode(raw2.encode("utf-8")).decode("ascii")
-        except Exception as e:
-            print(f"[BACKEND-UPDATE] تعذر فك darktunnel: {e}")
-            return t
-
-    if not RUN_APP_RE.search(t):
-        return t
-    return _replace_domain_and_ip(t, new_domain)
-
-
-async def update_auto_servers(new_domain: str) -> list:
-    """يحدّث فقط السيرفرات المعلمة "تجديد تلقائي" من البوت الأساسي:
-    يستبدل الدومين القديم بالجديد في كل حقل يحتويه — بدون إضافة أي
-    سيرفر جديد، وبدون ما يشعر مستخدم التطبيق (تحديث صامت كامل).
-
-    ترجع قائمة بأسماء السيرفرات التي تم تحديثها فعلاً."""
-    updated = []
-    if not BACKEND_API_URL or not BACKEND_ADMIN_KEY:
-        return updated
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                BACKEND_API_URL,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    print(f"[BACKEND-UPDATE] فشل جلب القائمة ({resp.status})")
-                    return updated
-                data = await resp.json(content_type=None)
-
-            for srv in data.get("servers", []):
-                if not srv.get("auto_update"):
-                    continue
-                sid = srv.get("id")
-                if sid is None:
-                    continue
-                # كل حقل يتحدّث فقط إذا تغيّر فعلاً — يدعم darktunnel:// (Base64)
-                cfg_old = (srv.get("config") or "").strip()
-                cfg_new = replace_run_domain_in_text(cfg_old, new_domain)
-                run_based = (cfg_new != cfg_old) or _config_mentions_run(cfg_old)
-
-                payload_old = (srv.get("payload") or "").strip()
-                payload_new = replace_run_domain_in_text(payload_old, new_domain)
-                if run_based and payload_new:
-                    payload_new = _replace_connected_ip(payload_new, new_domain)
-
-                proxy_old = (srv.get("proxy_host") or "").strip()
-                proxy_new = replace_run_domain_in_text(proxy_old, new_domain)
-
-                body = {}
-                if cfg_new != cfg_old:
-                    body["config"] = cfg_new
-                if payload_new != payload_old:
-                    body["payload"] = payload_new
-                if proxy_new != proxy_old:
-                    body["proxy_host"] = proxy_new
-                if not body:
-                    continue
-                async with session.put(
-                    f"{BACKEND_API_URL}/{sid}",
-                    json=body,
-                    headers={"X-API-Key": BACKEND_ADMIN_KEY},
-                    timeout=aiohttp.ClientTimeout(total=15),
-                ) as resp:
-                    if resp.status == 200:
-                        updated.append(srv.get("name"))
-                        print(f"[BACKEND-UPDATE] ✅ تحديث الحقول {list(body.keys())}: {srv.get('name')}")
-                    else:
-                        err = await resp.text()
-                        print(f"[BACKEND-UPDATE] ❌ فشل {srv.get('name')}: {resp.status} {err[:200]}")
-
-            if not any(srv.get("auto_update") for srv in data.get("servers", [])):
-                print("[BACKEND-UPDATE] ماكو سيرفرات معلمة للتجديد — علّمها من البوت الأساسي (زر ♻️)")
-    except Exception as e:
-        print(f"[BACKEND-UPDATE-ERR] {e}")
-    return updated
-
-
 async def take_screenshot_and_send(page, bot_instance, user_id, caption: str):
     path = f"screen_{user_id}.png"
     try:
@@ -355,103 +196,236 @@ async def take_screenshot_and_send(page, bot_instance, user_id, caption: str):
 
 
 # ============================================================
-# انتظار رابط run.app — 5 محاولات تشمل Shadow DOM
+# استخراج رابط run.app — فحص شامل لصفحة واحدة
 # ============================================================
-async def wait_for_run_url(page, timeout=360) -> str:
-    started = asyncio.get_event_loop().time()
-    deadline = started + timeout
+async def scan_page_for_run_url(page) -> str:
+    # 1) locator مباشر (يخترق Shadow DOM المفتوح تلقائياً)
+    try:
+        link_locator = page.locator('a[href*="run.app"]')
+        cnt = await link_locator.count()
+        if cnt > 0:
+            for i in range(cnt):
+                href = await link_locator.nth(i).get_attribute("href")
+                if href and "run.app" in href and "service-name" not in href.lower():
+                    return href
+    except Exception:
+        pass
 
-    while asyncio.get_event_loop().time() < deadline:
-        await asyncio.sleep(2)
-        waited = int(asyncio.get_event_loop().time() - started)
-        if waited % 60 == 0:
-            print(f"[RUN-URL] لا يزال الانتظار… ({waited} ثانية)")
-
-        # محاولة 1: locator مباشر
-        try:
-            link_locator = page.locator('a[href*="run.app"]')
-            count = await link_locator.count()
-            if count > 0:
-                for i in range(count):
-                    href = await link_locator.nth(i).get_attribute("href")
-                    if href and "run.app" in href and "service-name" not in href.lower():
-                        return href
-        except Exception:
-            pass
-
-        # محاولة 2: من URL الصفحة
-        try:
-            url_now = page.url
-            if "run.app" in url_now:
-                m = re.search(
-                    r'(https://[\w\-]+\.(?:[a-z]+-)?[a-z]+\d?\.run\.app[\w\-/]*)',
-                    url_now
-                )
-                if m and "service-name" not in m.group(1).lower():
-                    return m.group(1)
-        except Exception:
-            pass
-
-        # محاولة 3: JavaScript يخترق Shadow DOM
-        try:
-            result = await asyncio.wait_for(
-                page.evaluate("""() => {
-                    function findRunAppLinks(root) {
-                        const links = [];
-                        root.querySelectorAll('a[href*="run.app"]').forEach(a => {
-                            const h = a.href || a.getAttribute('href') || '';
-                            if (h.includes('run.app') && !h.includes('service-name'))
-                                links.push(h);
-                        });
-                        root.querySelectorAll('*').forEach(el => {
-                            if (el.shadowRoot) {
-                                const inner = findRunAppLinks(el.shadowRoot);
-                                links.push(...inner);
-                            }
-                        });
-                        return links;
-                    }
-                    return findRunAppLinks(document);
-                }"""),
-                timeout=10
+    # 2) من URL الصفحة الحالية
+    try:
+        url_now = page.url
+        if "run.app" in url_now:
+            m = re.search(
+                r'(https://[\w\-]+\.(?:[a-z]+-)?[a-z]+\d?\.run\.app[\w\-/]*)',
+                url_now,
             )
-            if result and len(result) > 0:
-                return result[0]
-        except Exception:
-            pass
+            if m and "service-name" not in m.group(1).lower():
+                return m.group(1)
+    except Exception:
+        pass
 
-        # محاولة 4: كل frame
+    # 3) بحث معمّق: href/title/aria-label/نص الروابط + Shadow DOM
+    try:
+        result = await asyncio.wait_for(
+            page.evaluate("""() => {
+                function findRunApp(root, out) {
+                    root.querySelectorAll('a[href*="run.app"]').forEach(a => {
+                        out.push(a.href || a.getAttribute('href') || '');
+                    });
+                    root.querySelectorAll('[href*="run.app"]').forEach(a => {
+                        out.push(a.getAttribute('href') || '');
+                    });
+                    root.querySelectorAll('[title*="run.app"]').forEach(a => {
+                        out.push(a.getAttribute('title') || '');
+                    });
+                    root.querySelectorAll('[aria-label*="run.app"]').forEach(a => {
+                        out.push(a.getAttribute('aria-label') || '');
+                    });
+                    root.querySelectorAll('a').forEach(a => {
+                        const t = (a.innerText || '').trim();
+                        if (t.includes('.run.app')) out.push(t);
+                    });
+                    root.querySelectorAll('*').forEach(el => {
+                        if (el.shadowRoot) findRunApp(el.shadowRoot, out);
+                    });
+                    return out;
+                }
+                const links = findRunApp(document, []);
+                return links.filter(h => h.includes('run.app')
+                    && !h.includes('service-name') && h.length > 10);
+            }"""),
+            timeout=10,
+        )
+        if result and len(result) > 0:
+            return result[0]
+    except Exception:
+        pass
+
+    # 4) كل frame
+    try:
+        for frame in page.frames:
+            try:
+                links = await asyncio.wait_for(
+                    frame.evaluate("""() => {
+                        const out = [];
+                        document.querySelectorAll('a').forEach(a => {
+                            const h = a.href || '';
+                            if (h.includes('run.app') && !h.includes('service-name'))
+                                out.push(h);
+                        });
+                        return out;
+                    }"""),
+                    timeout=5,
+                )
+                if links:
+                    return links[0]
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 5) نص الصفحة كامل
+    try:
+        txt = await asyncio.wait_for(read_page_text(page), timeout=8)
+        found = extract_run_url(txt)
+        if found:
+            return found
+    except Exception:
+        pass
+
+    return ""
+
+
+# ============================================================
+# انتظار رابط run.app — الآن مع مراقبة ردود الشبكة أيضاً
+# ============================================================
+async def wait_for_run_url(page, timeout=240) -> str:
+    """كونسول Google يسحب حالة النشر من واجهات داخلية تحتوي رابط
+    run.app كاملاً داخل JSON، حتى لو كان ظاهره على الشاشة مبتوراً.
+    نراقب ردود الشبكة أثناء الانتظار ونلتقط الرابط من هناك أيضاً."""
+    found = {"url": ""}
+
+    async def _on_response(resp):
         try:
-            for frame in page.frames:
-                try:
-                    links = await asyncio.wait_for(
-                        frame.evaluate("""() => {
-                            const out = [];
-                            document.querySelectorAll('a').forEach(a => {
-                                const h = a.href || '';
-                                if (h.includes('run.app') && !h.includes('service-name'))
-                                    out.push(h);
-                            });
-                            return out;
-                        }"""),
-                        timeout=5
-                    )
-                    if links:
-                        return links[0]
-                except Exception:
-                    continue
+            if found["url"]:
+                return
+            ct = (resp.headers or {}).get("content-type", "")
+            if "json" not in ct and "text" not in ct:
+                return
+            body = await resp.text()
+            u = extract_run_url(body)
+            if u:
+                found["url"] = u
         except Exception:
             pass
 
-        # محاولة 5: من نص الصفحة
+    try:
+        page.on("response", _on_response)
+    except Exception:
+        pass
+
+    deadline = asyncio.get_event_loop().time() + timeout
+    try:
+        while asyncio.get_event_loop().time() < deadline:
+            if found["url"]:
+                return found["url"]
+            u = await scan_page_for_run_url(page)
+            if u:
+                return u
+            await asyncio.sleep(3)
+    finally:
         try:
-            txt = await asyncio.wait_for(read_page_text(page), timeout=8)
-            found = extract_run_url(txt)
-            if found:
-                return found
+            page.remove_listener("response", _on_response)
         except Exception:
             pass
+    return found["url"] or ""
 
+
+# ============================================================
+# محاولة بديلة: قائمة الخدمات ثم صفحة التفاصيل
+# ============================================================
+async def recover_run_url_from_console(page, project_id: str, authuser: str) -> str:
+    """بديل ذكي بعد فشل انتظار الرابط: يفتح قائمة خدمات Cloud Run
+    للمشروع، ينتظر ظهور الخدمة، يدخل صفحة تفاصيلها ويستخرج الرابط."""
+    try:
+        list_url = (
+            f"https://console.cloud.google.com/run"
+            f"?project={project_id}&authuser={authuser}"
+        )
+        await goto_google_with_retry(
+            page, list_url, "قائمة خدمات Cloud Run", attempts=2
+        )
+    except GoogleNavigationError:
+        return ""
+
+    await asyncio.sleep(8)
+
+    # 1) قد تعرض القائمة نفسها الرابط (نص/href/title)
+    url = await scan_page_for_run_url(page)
+    if url:
+        return url
+
+    # 2) انتظر ظهور الخدمة ثم ادخل تفاصيلها عبر رابط الصف
+    detail_href = ""
+    deadline = asyncio.get_event_loop().time() + 180
+    while asyncio.get_event_loop().time() < deadline:
+        url = await scan_page_for_run_url(page)
+        if url:
+            return url
+        try:
+            hrefs = await asyncio.wait_for(
+                page.evaluate("""() => {
+                    function deep(root, out) {
+                        root.querySelectorAll('a[href*="/run/detail/"]')
+                            .forEach(a => out.push(a.getAttribute('href') || ''));
+                        root.querySelectorAll('*').forEach(el => {
+                            if (el.shadowRoot) deep(el.shadowRoot, out);
+                        });
+                        return out;
+                    }
+                    return deep(document, []);
+                }"""),
+                timeout=10,
+            )
+            if hrefs:
+                detail_href = hrefs[0]
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(5)
+
+    if not detail_href:
+        return ""
+
+    if detail_href.startswith("/"):
+        detail_href = "https://console.cloud.google.com" + detail_href
+
+    try:
+        await goto_google_with_retry(
+            page, detail_href, "صفحة تفاصيل الخدمة", attempts=2
+        )
+    except GoogleNavigationError:
+        return ""
+
+    await asyncio.sleep(8)
+    return await wait_for_run_url(page, timeout=120)
+
+
+async def detect_console_error(page) -> str:
+    """يلتقط رسالة خطأ واضحة من الصفحة (إن وجدت) لتشخيص الفشل."""
+    try:
+        txt = await asyncio.wait_for(read_page_text(page), timeout=8)
+    except Exception:
+        return ""
+    low = txt.lower()
+    for k in [
+        "failed to create", "creation failed", "permission denied",
+        "quota", "is required", "invalid",
+    ]:
+        idx = low.find(k)
+        if idx != -1:
+            snippet = txt[max(0, idx - 80): idx + 120].replace("\n", " ").strip()
+            return snippet[:200]
     return ""
 
 
@@ -848,7 +822,25 @@ async def enable_cloud_run_api(page, project_id: str, authuser: str) -> bool:
                 enable = await frame.query_selector('button:has-text("Enable")')
                 if enable and await enable.is_visible():
                     await enable.click()
-                    await asyncio.sleep(10)
+                    # ننتظر تأكيد التفعيل فعلياً (ظهور Manage) حتى 60 ثانية
+                    for _ in range(12):
+                        await asyncio.sleep(5)
+                        for f2 in page.frames:
+                            try:
+                                m2 = await f2.query_selector(
+                                    'button:has-text("Manage")'
+                                )
+                                if m2 and await m2.is_visible():
+                                    print("[API] ✅ تأكيد التفعيل: Manage ظاهر")
+                                    return True
+                                d2 = await f2.query_selector(
+                                    'a:has-text("Disable API")'
+                                )
+                                if d2 and await d2.is_visible():
+                                    print("[API] ✅ تأكيد التفعيل: Disable ظاهر")
+                                    return True
+                            except Exception:
+                                continue
                     return True
             except Exception:
                 continue
@@ -1214,7 +1206,7 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
                     try:
                         api_ok = await asyncio.wait_for(
                             enable_cloud_run_api(page, project_id, authuser),
-                            timeout=90
+                            timeout=150
                         )
                     except Exception:
                         api_ok = False
@@ -1359,41 +1351,52 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
                 step += 1
                 await log(f"[{tag}] • {step}) انتظار رابط النشر…")
 
+                # كشف فشل مبكر: إذا واجهة الإنشاء ما زالت ظاهرة
+                # فمعناه أن Create لم يُقبل (حقل ناقص أو خطأ تحقق)
                 try:
-                    await asyncio.wait_for(
-                        page.wait_for_load_state("networkidle"),
-                        timeout=30
+                    await asyncio.sleep(12)
+                    form_still = await page.query_selector(
+                        'input[aria-label*="Container image"], '
+                        'input[formcontrolname="imageUrl"]'
                     )
+                    if form_still and await form_still.is_visible():
+                        for _ in range(2):
+                            await log(
+                                f"[{tag}] ⚠️ Create لم يُقبل — "
+                                f"إعادة المحاولة…"
+                            )
+                            if await click_create_service_safe(page):
+                                await asyncio.sleep(12)
+                            again = await page.query_selector(
+                                'input[aria-label*="Container image"], '
+                                'input[formcontrolname="imageUrl"]'
+                            )
+                            if not (again and await again.is_visible()):
+                                break
                 except Exception:
                     pass
 
                 final_url = ""
                 try:
                     final_url = await asyncio.wait_for(
-                        wait_for_run_url(page, timeout=360),
-                        timeout=370
+                        wait_for_run_url(page, timeout=240),
+                        timeout=250
                     )
                 except Exception:
                     final_url = ""
 
-                # خطة بديلة: الخدمة أحياناً تُنشر فعلاً لكن صفحة الإنشاء
-                # لا تعرض الرابط — نفتح قائمة خدمات Cloud Run وندور
-                # عليه هناك (رابط الخدمة يظهر بالقائمة دائماً)
-                if not final_url:
+                # 🔄 محاولة بديلة: قائمة الخدمات ثم صفحة التفاصيل
+                if not final_url and project_id:
+                    await log(
+                        f"[{tag}] 🔄 محاولة بديلة: "
+                        f"فتح قائمة خدمات Cloud Run…"
+                    )
                     try:
-                        await log(f"[{tag}] 🔄 محاولة بديلة: فتح قائمة خدمات Cloud Run…")
-                        await page.goto(
-                            "https://console.cloud.google.com/run/services",
-                            wait_until="commit",
-                            timeout=60_000,
-                        )
-                        try:
-                            await page.wait_for_load_state("domcontentloaded", timeout=30_000)
-                        except Exception:
-                            pass
                         final_url = await asyncio.wait_for(
-                            wait_for_run_url(page, timeout=180),
-                            timeout=190
+                            recover_run_url_from_console(
+                                page, project_id, authuser
+                            ),
+                            timeout=240,
                         )
                     except Exception:
                         final_url = ""
@@ -1412,10 +1415,18 @@ async def full_workflow(page, user_id, send_msg, username, sso_url: str = ""):
                         f"📋 <b>VLESS:</b>\n<code>{vless}</code>"
                     )
                     await publish_result(final_url, vless)
-                    # تحديث صامت كامل — بدون أي رسالة لأي مستخدم
-                    await update_auto_servers(domain)
                     return final_url
                 else:
+                    # تشخيص: رسالة خطأ من الصفحة إن وُجدت
+                    try:
+                        err = await detect_console_error(page)
+                    except Exception:
+                        err = ""
+                    if err:
+                        await log(
+                            f"[{tag}] ⚠️ رسالة من الصفحة:\n"
+                            f"<code>{err}</code>"
+                        )
                     await log(f"[{tag}] ⏰ انتهى الوقت بدون رابط")
                     await take_screenshot_and_send(
                         page, bot, user_id,
@@ -1726,7 +1737,7 @@ async def cmd_start(message: Message):
     await message.answer(
         "👋 <b>Google Cloud → Cloud Run</b>\n\n"
         "📎 أرسل رابط <b>Google SSO</b> من:\n"
-        "https://www.cloudskillsboost.google/focuses/20774?parent=catalog\n\n"
+        "https://www.skills.google/focuses/33353?parent=catalog\n\n"
         "🔐 كلمة السر → يخبرك البوت\n"
         "🎯 كل شيء تلقائي\n\n"
         "/cancel — إلغاء\n/status — حالة"
@@ -1789,7 +1800,7 @@ async def handle_url(message: Message):
         await message.answer(
             "⚠️ <b>رابط غير صالح!</b>\n\n"
             "يرجى إرسال الرابط الصحيح من:\n"
-            "https://www.cloudskillsboost.google/focuses/20774?parent=catalog",
+            "https://www.skills.google/focuses/33353?parent=catalog",
             disable_web_page_preview=True
         )
         try:
